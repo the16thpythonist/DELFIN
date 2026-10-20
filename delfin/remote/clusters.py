@@ -73,6 +73,8 @@ class Cluster:
     allowed_partitions: tuple[str, ...]  # empty: any partition
     default_partition: Optional[str]  # None: the cluster's own default
     pinned: bool                      # ctun accepts only the pinned host key
+    requires_password: bool           # what a login asks for (ctun's config)
+    requires_otp: bool
     problems: tuple[str, ...]         # why DELFIN will not use it yet; empty when usable
     ctun_config: Optional[Path]       # the ctun config file that describes it
 
@@ -122,7 +124,7 @@ def _cluster(name: str, entry: Any, config, config_error: str,
     default_partition = _default_partition(entry.get("default_partition"), partitions,
                                            problems)
 
-    target, pinned = "", False
+    target, pinned, requires_password, requires_otp = "", False, True, False
     if config is None:
         problems.append(f"ctun's config cannot be read ({config_error})")
     elif name not in config.clusters:
@@ -135,6 +137,8 @@ def _cluster(name: str, entry: Any, config, config_error: str,
         if not pinned:
             problems.append(f"ctun has not pinned its host key; check the fingerprint "
                             f"and run `ctun -t {name} hostkey --pin`")
+        requires_password = config.clusters[name].requires_password
+        requires_otp = config.clusters[name].requires_otp
         budget = config.clusters[name].budget
         if budget is not None and budget.guard_scope != "every-command":
             problems.append(
@@ -150,7 +154,8 @@ def _cluster(name: str, entry: Any, config, config_error: str,
     return Cluster(name=name, target=target, work_dir=work_dir,
                    install_root=install_root, software_dir=software_dir,
                    allowed_partitions=partitions, default_partition=default_partition,
-                   pinned=pinned, problems=tuple(problems),
+                   pinned=pinned, requires_password=requires_password,
+                   requires_otp=requires_otp, problems=tuple(problems),
                    ctun_config=config_file if config is not None else None)
 
 

@@ -58,6 +58,14 @@ class BudgetGuardError(RemoteError):
     code = "budget_guard_error"
 
 
+class LoginFailed(RemoteError):
+    """The login did not open the tunnel: a wrong password or OTP, a
+    refused host key, a cluster that did not answer. The message never
+    holds a secret."""
+
+    code = "login_failed"
+
+
 class HostKeyMismatch(RemoteError):
     """The cluster presents a host key other than the pinned one."""
 

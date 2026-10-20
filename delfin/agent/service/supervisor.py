@@ -50,14 +50,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import attention_feed, eventlog, protocol, rundir
+from . import attention_feed, clusters_feed, eventlog, protocol, rundir
 
 #: What this service does beyond its protocol, for a launcher deciding
 #: what it may ask. 2: a dry-run session.shutdown only says what it would
 #: cut -- a service before it ignores dryRun and would end the session.
 #: 3: attention.list/answer/dismiss and attention.updated (what needs the
 #: user, from every DELFIN process), and session.create's brief.
-SERVICE_VERSION = 3
+#: 4: clusters.list, cluster.login/logout and jobs.list (delfin.remote).
+SERVICE_VERSION = 4
 
 #: Requests a window sends to the service itself (the one definition is
 #: protocol.SERVICE_REQUESTS, which the TUI's types are generated from).
@@ -74,7 +75,8 @@ FORWARDED = frozenset({"session.prompt", "session.cancel", "session.setMode",
 ACTING = frozenset({"session.create", "session.prompt", "session.cancel",
                     "session.setMode", "session.shutdown", "permission.reply",
                     "session.message", "service.shutdown", "session.toggleTasks",
-                    "session.setTitle", "attention.answer", "attention.dismiss"})
+                    "session.setTitle", "attention.answer", "attention.dismiss",
+                    "cluster.login", "cluster.logout"})
 
 UNKNOWN_SESSION = protocol.UNKNOWN_SESSION
 WORKER_GONE = protocol.WORKER_GONE
@@ -1170,6 +1172,25 @@ class Supervisor:
         done = await asyncio.to_thread(attention_feed.dismiss, str(params["id"]))
         await self._refresh_attention(force=True)
         return {"ok": bool(done.get("ok")), "error": str(done.get("error") or "") or None}
+
+    # -- clusters and background work (delfin.remote, clusters_feed) ------------------------
+    async def _m_clusters_list(self, _client: Client, _params: dict) -> dict:
+        return await asyncio.to_thread(clusters_feed.clusters)
+
+    async def _m_cluster_login(self, _client: Client, params: dict) -> dict:
+        # The password and OTP live in this call's params only. They are not
+        # in FORWARDED (no worker sees them), go into no event, and
+        # clusters_feed.login returns no text that holds them; a failure is
+        # answered, not raised, so _dispatch has nothing to echo.
+        return await asyncio.to_thread(clusters_feed.login, str(params["name"]),
+                                       str(params.get("password") or ""),
+                                       str(params.get("otp") or ""))
+
+    async def _m_cluster_logout(self, _client: Client, params: dict) -> dict:
+        return await asyncio.to_thread(clusters_feed.logout, str(params["name"]))
+
+    async def _m_jobs_list(self, _client: Client, _params: dict) -> dict:
+        return await asyncio.to_thread(clusters_feed.jobs, self._summaries())
 
     async def _watch_attention(self) -> None:
         """While a window is there to tell: the attention records looked at

@@ -449,6 +449,16 @@ export interface AttentionAnswerParams {
 export interface AttentionDismissParams {
   "id": string
 }
+export interface ClustersListParams {}
+export interface ClusterLoginParams {
+  "name": string
+  "password"?: string | null
+  "otp"?: string | null
+}
+export interface ClusterLogoutParams {
+  "name": string
+}
+export interface JobsListParams {}
 export interface ServiceRequests {
   "hello": HelloParams
   "sessions.list": SessionsListParams
@@ -462,6 +472,10 @@ export interface ServiceRequests {
   "attention.list": AttentionListParams
   "attention.answer": AttentionAnswerParams
   "attention.dismiss": AttentionDismissParams
+  "clusters.list": ClustersListParams
+  "cluster.login": ClusterLoginParams
+  "cluster.logout": ClusterLogoutParams
+  "jobs.list": JobsListParams
 }
 export interface HelloResult {
   "protocolVersion": number
@@ -524,6 +538,25 @@ export interface AttentionDismissResult {
   "ok": boolean
   "error"?: string | null
 }
+export interface ClustersListResult {
+  "clusters": Record<string, unknown>[]
+}
+export interface ClusterLoginResult {
+  "ok": boolean
+  "opened": boolean
+  "code"?: string | null
+  "error"?: string | null
+}
+export interface ClusterLogoutResult {
+  "ok": boolean
+  "closed": boolean
+  "code"?: string | null
+  "error"?: string | null
+}
+export interface JobsListResult {
+  "groups": Record<string, unknown>[]
+  "errors": string[]
+}
 export interface ServiceResults {
   "hello": HelloResult
   "sessions.list": SessionsListResult
@@ -537,6 +570,10 @@ export interface ServiceResults {
   "attention.list": AttentionListResult
   "attention.answer": AttentionAnswerResult
   "attention.dismiss": AttentionDismissResult
+  "clusters.list": ClustersListResult
+  "cluster.login": ClusterLoginResult
+  "cluster.logout": ClusterLogoutResult
+  "jobs.list": JobsListResult
 }
 export interface SessionSummaryEvent {
   "summary": Record<string, unknown>
@@ -608,6 +645,7 @@ export interface AttentionItem {
   "createdAt": number
   "options": string[]
   "job"?: Record<string, unknown> | null
+  "cluster"?: string | null
 }
 
 /** Every event a window can receive: a session's own, and the service's. */

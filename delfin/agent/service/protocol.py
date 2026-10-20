@@ -249,6 +249,18 @@ SERVICE_REQUESTS: dict[str, dict[str, str]] = {
     "attention.list": {},
     "attention.answer": {"id": "string", "text": "string"},
     "attention.dismiss": {"id": "string"},
+    # DELFIN's clusters (delfin.remote, clusters_feed.py): each one in
+    # remote.clusters with its state, budget and job count. cluster.login
+    # carries what a person typed into the window's masked field: the
+    # service hands it to ctun and nowhere else -- never to a worker, into
+    # an event, a log or an error text -- and takes it only from a window.
+    "clusters.list": {},
+    "cluster.login": {"name": "string", "password": "string?", "otp": "string?"},
+    "cluster.logout": {"name": "string"},
+    # What runs in the background: the agents' shells, watches, sub-agents
+    # and wake-ups per session, DELFIN's job monitor, and the active jobs on
+    # each logged-in cluster.
+    "jobs.list": {},
 }
 
 SERVICE_RESULTS: dict[str, dict[str, str]] = {
@@ -278,6 +290,14 @@ SERVICE_RESULTS: dict[str, dict[str, str]] = {
     "attention.list": {"items": "[object]", "version": "integer?"},
     "attention.answer": {"ok": "boolean", "error": "string?"},
     "attention.dismiss": {"ok": "boolean", "error": "string?"},
+    "clusters.list": {"clusters": "[object]"},
+    # opened: the tunnel was opened now (false: it was up already). code: a
+    # delfin.remote error code (login_failed, cluster_not_usable, ...).
+    "cluster.login": {"ok": "boolean", "opened": "boolean", "code": "string?",
+                      "error": "string?"},
+    "cluster.logout": {"ok": "boolean", "closed": "boolean", "code": "string?",
+                       "error": "string?"},
+    "jobs.list": {"groups": "[object]", "errors": "[string]"},
 }
 
 #: Events from the service itself, to every window.
@@ -301,19 +321,21 @@ SERVICE_EVENTS: dict[str, dict[str, str]] = {
 }
 
 #: An attention item (attention.list, attention.updated). kind: question |
-#: confirm | plan | failed | alert | finished | budget | notice; group:
+#: confirm | plan | failed | alert | finished | budget | login | notice; group:
 #: needs | notices; blocking: someone waits for an answer. name: what it is
 #: about (a session's title, "job 4711 failed"); text: one line on what it
 #: needs; detail: what a peek shows. sessionId: the session it belongs to,
 #: if any -- sessionOpen: another process has it open (open a copy),
 #: sessionSaved: the store has it (resume it). job: a job's id, state,
 #: folder, error signatures, the diagnosis session, summary and fix.
+#: cluster: a login item's cluster -- the window opens its masked login
+#: field for it, and never sends attention.answer (a password is no answer).
 ATTENTION_ITEM: dict[str, str] = {
     "id": "string", "kind": "string", "group": "string", "blocking": "boolean",
     "name": "string", "text": "string", "detail": "string", "workspace": "string",
     "host": "string", "sessionId": "string", "sessionTitle": "string?",
     "sessionOpen": "boolean?", "sessionSaved": "boolean?", "createdAt": "number",
-    "options": "[string]", "job": "object?"}
+    "options": "[string]", "job": "object?", "cluster": "string?"}
 
 #: The fields of a session summary (session.summary, sessions.list). The
 #: last five say what the session is about in a few words, for the agent

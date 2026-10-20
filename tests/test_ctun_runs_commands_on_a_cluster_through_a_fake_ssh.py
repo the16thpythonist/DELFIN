@@ -88,13 +88,13 @@ def cluster(tmp_path, monkeypatch):
 
 
 def test_cluster_tunnel_is_a_core_dependency_from_the_release_with_the_api():
-    """0.7.0 is the first ctun with ``cluster_tunnel.api`` and host-key
-    pinning; the ceiling is the next minor, since a 0.x minor release may
-    change the API."""
+    """0.8.0: ``cluster_tunnel.api`` with host-key pinning (0.7.0) and a
+    login with given credentials (the window's masked field); the ceiling
+    is the next minor, since a 0.x minor release may change the API."""
     project = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     ctun = [r for r in project["dependencies"]
             if re.split(r"[<>=!~\[; ]", r, maxsplit=1)[0].lower() == "cluster-tunnel"]
-    assert ctun == ["cluster-tunnel>=0.7,<0.8"]
+    assert ctun == ["cluster-tunnel>=0.8,<0.9"]
 
 
 def test_without_a_master_a_command_needs_a_login_first(cluster):
@@ -150,6 +150,11 @@ def test_a_pinned_cluster_runs_every_ssh_against_its_own_key_file(cluster, tmp_p
         assert "StrictHostKeyChecking=yes" in argv, argv
         assert f'UserKnownHostsFile="{known_hosts}"' in argv, argv
         assert "GlobalKnownHostsFile=/dev/null" in argv, argv
+
+
+def test_credentials_for_a_login_never_print():
+    creds = api.Credentials("s3cret-pw", "424242")
+    assert "s3cret-pw" not in repr(creds) and "424242" not in repr(creds)
 
 
 def test_the_errors_the_remote_layer_maps_keep_their_exit_codes():

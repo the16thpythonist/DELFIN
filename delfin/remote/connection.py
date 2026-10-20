@@ -34,8 +34,8 @@ from cluster_tunnel import api as ctun_api
 from . import _inside_agent_session
 from . import clusters as _clusters
 from .errors import (BudgetExhausted, BudgetGuardError, ClusterNotUsable,
-                     HostKeyMismatch, LoginRequired, RemoteError, RemoteRefused,
-                     TransportError, UnknownCluster)
+                     HostKeyMismatch, LoginFailed, LoginRequired, RemoteError,
+                     RemoteRefused, TransportError, UnknownCluster)
 
 PathLike = Union[str, Path]
 
@@ -75,6 +75,23 @@ class Connection:
 
     def _where(self) -> dict:
         return {"config_path": self.cluster.ctun_config}
+
+    def login(self, password: str = "", otp: str = "", *, timeout: int = 120) -> bool:
+        """Open the tunnel with a password and OTP a person typed into DELFIN's
+        own masked field; they go to ctun (and through it to ssh's prompts)
+        and nowhere else. True when the tunnel was opened now, False when it
+        was up already. Raises LoginFailed with a message that holds neither."""
+        with _ctun_errors(self.name):
+            result = ctun_api.login(self.name,
+                                    credentials=ctun_api.Credentials(password, otp),
+                                    timeout=timeout, **self._where())
+        return not result.already_live
+
+    def logout(self) -> bool:
+        """Close the tunnel; True when one was open."""
+        with _ctun_errors(self.name):
+            (result,) = ctun_api.logout(self.name, **self._where())
+        return bool(getattr(result, "was_live", True))
 
     def is_live(self) -> bool:
         """Whether a person is logged in, i.e. ctun's master is alive."""
@@ -135,6 +152,8 @@ def _ctun_errors(name: str) -> Iterator[None]:
         raise BudgetGuardError(str(exc)) from exc
     except ctun_api.HostKeyError as exc:
         raise HostKeyMismatch(str(exc)) from exc
+    except ctun_api.LoginError as exc:
+        raise LoginFailed(str(exc)) from exc
     except (ctun_api.ConfigError, ctun_api.UnknownClusterError) as exc:
         raise ClusterNotUsable(name, (str(exc),)) from exc
     except ctun_api.ClusterTunnelError as exc:
