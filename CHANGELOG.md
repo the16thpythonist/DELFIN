@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — DELFIN knows its clusters, and only its own process reaches them
+
+- **`remote.clusters` in `~/.delfin_settings.json` names the clusters DELFIN
+  may use**; ctun's config says how each is reached. A cluster has a work
+  dir (default `~/delfin/jobs`) and an install root (`~/delfin/installs`)
+  on the cluster and may limit the partitions. DELFIN uses it only when
+  ctun has pinned its host key (`ctun -t <name> hostkey --pin`), a ctun
+  budget guard reads every command (`guard_scope: every-command`), and
+  every file ctun's ssh reads -- its config, an `ssh_config`, the pinned
+  key file, the budget script -- lies in ctun's directories or `~/.ssh`.
+  Otherwise it says what to fix, one line per problem.
+- **`delfin.remote.connection` is the one way to act on a cluster**:
+  commands as argv lists with captured output and a timeout, scripts fed
+  over the tunnel, transfers, the job list and the budget, with ctun's
+  errors as DELFIN's own (`login_required`, `budget_exhausted`, ...). It
+  refuses inside an agent session, where a command would otherwise drive
+  the user's ssh master.
+- **`delfin doctor` reports each cluster**: refused (with its problems),
+  usable but nobody logged in (with the login command), or logged in;
+  `--budget` also probes the budget over the tunnel.
+
+### Security — no agent route reaches cluster-tunnel's state
+
+- **ctun's config and cache directories are masked in every cage and
+  denied to every file tool**, at their real place (XDG-redirected too),
+  and created at once so nothing can be planted there before the user
+  writes ctun's config. The control socket of a logged-in master is the
+  user's identity on the cluster: a command in the process cage that found
+  it by walking the home connected to it; now it finds nothing there. The
+  config holds the ssh options DELFIN's own process runs with, so a
+  ProxyCommand written into it would have run outside every cage.
+- **A file in a directory every cage masks is not readable through a
+  granted root.** With `~/.config` granted, read_file returned ctun's
+  config: the deny globs see the path relative to its root
+  (`cluster-tunnel/config.yaml`), and a glob for that name would also hide
+  every checkout of the cluster-tunnel repository. The read gate now also
+  judges where the path really lies (approval codes and the account key
+  store included).
+
 ### Added — cluster-tunnel is a dependency, the base for sending calculations to a cluster
 
 - **DELFIN installs cluster-tunnel (ctun) 0.7.** ctun keeps one logged-in
