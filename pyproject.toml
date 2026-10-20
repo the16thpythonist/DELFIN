@@ -372,6 +372,8 @@ include = ["delfin*"]
 [tool.setuptools.package-data]
 "delfin" = [
     "installers/*.sh",
+    # Fed over the tunnel by delfin/remote/install.py.
+    "remote/scripts/*.sh",
     "logo/*.png",
     "logo/*.PNG",
     # The submit tab loads MANTA_readme_demo.gif through importlib.resources

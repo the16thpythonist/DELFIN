@@ -68,3 +68,22 @@ class TransportError(RemoteError):
     """ssh or rsync failed for a reason of their own."""
 
     code = "transport_error"
+
+
+class CommitNotPublished(RemoteError):
+    """The commit the PC runs is on no branch of the install sources, or the
+    PC does not run DELFIN from a git checkout at all; DELFIN installs only
+    published commits on a cluster unasked."""
+
+    code = "commit_not_published"
+
+
+class InstallFailed(RemoteError):
+    """install_delfin.sh failed on the cluster (``log`` holds its tail), or
+    did not finish in time."""
+
+    code = "install_failed"
+
+    def __init__(self, message: str, log: str = ""):
+        self.log = log
+        super().__init__(message + (f"\n{log}" if log else ""))

@@ -6,10 +6,15 @@ written only by the user) and ctun's config (its own default location, or
 
     "remote": {"clusters": {"kcist": {"work_dir": "~/delfin/jobs",
                                       "install_root": "~/delfin/installs",
-                                      "allowed_partitions": ["small"]}}}
+                                      "software_dir": "~/delfin/software",
+                                      "allowed_partitions": ["small", "batch"],
+                                      "default_partition": "small"}},
+               "install_sources": ["https://github.com/ComPlat/DELFIN"]}
 
 A cluster is one of DELFIN's when the settings name it; ctun's config says how
-it is reached. Output: a ``Cluster`` per name, with the problems that keep
+it is reached. ``install_sources`` are the repositories a commit must be
+published on before DELFIN installs it on a cluster unasked
+(``install_sources()``; ComPlat/DELFIN unless the settings say otherwise). Output: a ``Cluster`` per name, with the problems that keep
 DELFIN from using it in ``problems`` -- a bad entry is reported, never raised.
 
 Semantics:
@@ -26,8 +31,8 @@ Semantics:
   ``~/.ssh``. A ProxyCommand an agent wrote into one of them would run in
   DELFIN's own process, outside every cage. Not judged where ctun runs ssh
   inside WSL (native Windows): those are paths of another filesystem.
-* ``work_dir`` and ``install_root`` are directories on the cluster, under its
-  home (``~/...``, or a relative path, which means the same) or absolute;
+* ``work_dir``, ``install_root`` and ``software_dir`` (OpenMPI and the tools
+  every install shares) are directories on the cluster, under its home (``~/...``, or a relative path, which means the same) or absolute;
   never the home itself, ``/`` or a path with ``..``. The work dir bounds what
   the file tools reach without asking, so it must not be everything.
 """
@@ -48,8 +53,11 @@ PathLike = Union[str, Path]
 
 DEFAULT_WORK_DIR = "~/delfin/jobs"
 DEFAULT_INSTALL_ROOT = "~/delfin/installs"
+DEFAULT_SOFTWARE_DIR = "~/delfin/software"
+DEFAULT_INSTALL_SOURCES = ("https://github.com/ComPlat/DELFIN",)
 
-_KEYS = ("work_dir", "install_root", "allowed_partitions")
+_KEYS = ("work_dir", "install_root", "software_dir", "allowed_partitions",
+         "default_partition")
 _PARTITION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 
@@ -61,7 +69,9 @@ class Cluster:
     target: str                       # the ssh destination ctun uses; "" if ctun has no entry
     work_dir: str                     # on the cluster, "~/..." or absolute
     install_root: str                 # on the cluster, "~/..." or absolute
+    software_dir: str                 # on the cluster: what every install shares
     allowed_partitions: tuple[str, ...]  # empty: any partition
+    default_partition: Optional[str]  # None: the cluster's own default
     pinned: bool                      # ctun accepts only the pinned host key
     problems: tuple[str, ...]         # why DELFIN will not use it yet; empty when usable
     ctun_config: Optional[Path]       # the ctun config file that describes it
@@ -106,7 +116,11 @@ def _cluster(name: str, entry: Any, config, config_error: str,
     work_dir = _remote_dir(entry.get("work_dir", DEFAULT_WORK_DIR), "work_dir", problems)
     install_root = _remote_dir(entry.get("install_root", DEFAULT_INSTALL_ROOT),
                                "install_root", problems)
+    software_dir = _remote_dir(entry.get("software_dir", DEFAULT_SOFTWARE_DIR),
+                               "software_dir", problems)
     partitions = _partitions(entry.get("allowed_partitions", []), problems)
+    default_partition = _default_partition(entry.get("default_partition"), partitions,
+                                           problems)
 
     target, pinned = "", False
     if config is None:
@@ -134,7 +148,8 @@ def _cluster(name: str, entry: Any, config, config_error: str,
                 config_file, name, budget.script)))
         problems += _files_out_of_reach(files)
     return Cluster(name=name, target=target, work_dir=work_dir,
-                   install_root=install_root, allowed_partitions=partitions,
+                   install_root=install_root, software_dir=software_dir,
+                   allowed_partitions=partitions, default_partition=default_partition,
                    pinned=pinned, problems=tuple(problems),
                    ctun_config=config_file if config is not None else None)
 
@@ -176,6 +191,43 @@ def _partitions(value: Any, problems: list[str]) -> tuple[str, ...]:
         problems.append(f"allowed_partitions has names Slurm would not accept: {bad}")
         return ()
     return tuple(value)
+
+
+def _default_partition(value: Any, allowed: tuple[str, ...],
+                       problems: list[str]) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _PARTITION.fullmatch(value):
+        problems.append(f"default_partition must be a partition name, not {value!r}")
+        return None
+    if allowed and value not in allowed:
+        problems.append(f"default_partition {value!r} is not in allowed_partitions {list(allowed)}")
+        return None
+    return value
+
+
+def install_sources(settings: Optional[dict] = None) -> tuple[str, ...]:
+    """The repositories (https URLs, no trailing ``.git``) a commit must be
+    published on for DELFIN to install it on a cluster unasked. An entry
+    that is not an https URL is left out, never guessed at."""
+    if settings is None:
+        from delfin.user_settings import load_settings
+        settings = load_settings()
+    remote = settings.get("remote") if isinstance(settings, dict) else None
+    value = remote.get("install_sources") if isinstance(remote, dict) else None
+    if value is None:
+        return DEFAULT_INSTALL_SOURCES
+    if not isinstance(value, list):
+        return ()
+    out = []
+    for url in value:
+        if not isinstance(url, str) or not re.fullmatch(r"https://[^\s'\"\\]+", url.strip()):
+            continue
+        url = url.strip().rstrip("/")
+        url = url[:-4] if url.endswith(".git") else url
+        if url not in out:
+            out.append(url)
+    return tuple(out)
 
 
 def _files_out_of_reach(files: list[tuple[str, Any]]) -> list[str]:
