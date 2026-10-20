@@ -10,6 +10,8 @@
 #   inuse               the commits the user's queued and running jobs name
 #   remove DIR          deletes one install of DELFIN's (never a running one)
 #   log    DIR          the last 60 lines of an install's log
+#   warnings DIR        what a complete install lacks (tools that failed,
+#                       no ORCA), one line each
 #
 # A directory is DELFIN's only when it holds .delfin-commit, which
 # install.py writes with the uploaded tree: nothing else is ever listed or
@@ -52,13 +54,21 @@ case "$action" in
     rm -f "$dir/.delfin-install.exit" "$dir/.delfin-install-complete"
     mkdir -p "$prefix"
     # setsid + nohup: the install outlives this ssh session and the tunnel.
-    # The marker is written only when install_delfin.sh succeeds.
+    # install_delfin.sh fails when any one tool does (std2 needs gfortran,
+    # which a login node may not have). The install is complete when it
+    # succeeded, or when its venv imports DELFIN and OpenMPI was set up;
+    # what failed then is listed in .delfin-install.warnings.
     nohup setsid bash -c '
       cd "$1" || exit 1
       bash delfin/installers/install_delfin.sh --repo "$1" --prefix "$2" \
         --profile standard --yes
       rc=$?
-      if [ "$rc" -eq 0 ]; then date -u +%Y-%m-%dT%H:%M:%SZ > "$1/.delfin-install-complete"; fi
+      grep -E "^\[delfin-install\] (FAILED|ORCA +not found)" "$1/.delfin-install.log" \
+        > "$1/.delfin-install.warnings" 2>/dev/null
+      if [ "$rc" -eq 0 ] || { (cd / && "$1/.venv/bin/python" -c "import delfin") >/dev/null 2>&1 \
+           && ! grep -qE "^\[delfin-install\] FAILED +openmpi" "$1/.delfin-install.log"; }; then
+        date -u +%Y-%m-%dT%H:%M:%SZ > "$1/.delfin-install-complete"
+      fi
       echo "$rc" > "$1/.delfin-install.exit"
     ' delfin-install "$dir" "$prefix" > "$dir/.delfin-install.log" 2>&1 < /dev/null &
     echo $! > "$dir/.delfin-install.pid"
@@ -84,6 +94,10 @@ case "$action" in
   log)
     dir="$(home_path "${2:?log needs a directory}")"
     tail -n 60 "$dir/.delfin-install.log" 2>/dev/null ;;
+  warnings)
+    dir="$(home_path "${2:?warnings needs a directory}")"
+    [ -f "$dir/.delfin-install-complete" ] || exit 0
+    sed 's/^\[delfin-install\] *//' "$dir/.delfin-install.warnings" 2>/dev/null ;;
   *)
     echo "unknown action: $action" >&2; exit 2 ;;
 esac

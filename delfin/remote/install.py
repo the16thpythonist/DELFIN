@@ -26,7 +26,11 @@ Semantics:
   OpenMPI and the tools are found or built once and shared. It writes
   ``~/.delfin_settings.json`` and ``~/.delfin_env.sh`` on the cluster as any
   install does.
-* A complete install is used as it is; a running one is waited for; a
+* An install is complete when install_delfin.sh succeeded, or when its venv
+  imports DELFIN and OpenMPI was set up although a tool failed (std2 is
+  built with gfortran, which a login node may not have): what it lacks --
+  the tools that failed, ORCA not found -- comes back in ``warnings``.
+  A complete install is used as it is; a running one is waited for; a
   failed one is reported with the tail of its log and started again only
   with ``retry=True``.
 * ``remove_unused`` deletes DELFIN's installs (directories with
@@ -78,6 +82,7 @@ class Outcome:
     installed_now: bool = False
     source: str = ""  # the install source the commit was found on
     notes: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)  # what the install lacks
 
 
 def job_comment(sha: str) -> str:
@@ -149,7 +154,8 @@ def ensure_installed(conn, *, commit: Optional[Commit] = None,
                      "the cluster runs the commit without them")
     current = state(conn, commit.sha)
     if current == "complete":
-        return Outcome(commit.sha, path, "complete", notes=notes)
+        return Outcome(commit.sha, path, "complete", notes=notes,
+                       warnings=_warnings(conn, path))
     if current == "failed" and not retry:
         raise InstallFailed(f"the install of {commit.sha[:10]} on {conn.name} failed before; "
                             "fix the cause and install again with retry",
@@ -178,7 +184,7 @@ def ensure_installed(conn, *, commit: Optional[Commit] = None,
         if current == "complete":
             say(f"{commit.sha[:10]} is installed on {conn.name}")
             return Outcome(commit.sha, path, "complete", installed_now=True, source=source,
-                           notes=notes)
+                           notes=notes, warnings=_warnings(conn, path))
         if current in ("failed", "partial", "absent"):
             raise InstallFailed(f"the install of {commit.sha[:10]} on {conn.name} failed",
                                 log=_script(conn, "log", path))
@@ -226,6 +232,11 @@ def remove_unused(conn, keep: Sequence[str] = ()) -> list[str]:
 
 def _install_dir(conn, sha: str) -> str:
     return f"{conn.cluster.install_root.rstrip('/')}/{sha}"
+
+
+def _warnings(conn, path: str) -> list[str]:
+    return [line.strip() for line in _script(conn, "warnings", path).splitlines()
+            if line.strip()]
 
 
 def _relative_to_home(path: str) -> str:

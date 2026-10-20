@@ -58,11 +58,18 @@ cat "$FAKE_SQUEUE" 2>/dev/null
 
 _STUB_INSTALLER = """\
 #!/usr/bin/env bash
-# Stands in for install_delfin.sh: records its arguments; fails when the
-# tree holds FAIL.
+# Stands in for install_delfin.sh: records its arguments and makes a venv
+# whose python "imports DELFIN" (exits 0). FAIL: fails before any venv.
+# TOOLFAIL: a tool fails, as std2 without gfortran. MPIFAIL: OpenMPI fails.
 echo "stub install $*"
 [ -f FAIL ] && { echo "stub failure" >&2; exit 3; }
+mkdir -p "$2/.venv/bin" && printf '#!/bin/sh\\nexit 0\\n' > "$2/.venv/bin/python"
+chmod +x "$2/.venv/bin/python"
 mkdir -p "$4" && echo "$2" >> "$4/installed-by-stub"
+[ -f TOOLFAIL ] && { echo "[delfin-install] FAILED qm: xtb std2 (missing: std2)"; \\
+                     echo "[delfin-install] FAILED   install of tools (see the lines above)"; exit 1; }
+[ -f MPIFAIL ] && { echo "[delfin-install] FAILED   openmpi"; exit 1; }
+exit 0
 """
 
 
@@ -220,6 +227,26 @@ def test_a_failed_install_is_reported_and_started_again_only_on_request(world):
     with pytest.raises(errors.InstallFailed):
         _ensure(world, commit, retry=True)
     assert "stub install" in log.read_text(encoding="utf-8"), "retry ran the installer again"
+
+
+def test_a_tool_that_fails_is_a_warning_of_a_complete_install(world):
+    """std2 is built with gfortran, which kcist's login node lacks: DELFIN
+    works without it, and the calculations that need it say so."""
+    commit = world.commit("std2 cannot be built here", {"TOOLFAIL": "1\n"})
+    world.publish()
+    outcome = _ensure(world, commit)
+    assert outcome.state == "complete"
+    assert outcome.warnings == ["FAILED qm: xtb std2 (missing: std2)",
+                                "FAILED   install of tools (see the lines above)"]
+    assert _ensure(world, commit).warnings == outcome.warnings
+
+
+@pytest.mark.parametrize("marker", ["MPIFAIL", "FAIL"])
+def test_no_openmpi_or_no_working_venv_is_a_failed_install(world, marker):
+    commit = world.commit(f"breaks with {marker}", {marker: "1\n"})
+    world.publish()
+    with pytest.raises(errors.InstallFailed):
+        _ensure(world, commit)
 
 
 def test_unused_installs_go_and_kept_or_queued_ones_stay(world):
