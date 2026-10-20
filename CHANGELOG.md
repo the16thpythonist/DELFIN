@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — the window shows the clusters and the jobs, and logs in without the agent
+
+- **`/clusters` shows every cluster of `remote.clusters`**: logged in,
+  logged out, or refused with why (no pinned host key, ...), with its
+  target, budget and active jobs. Enter on a logged-out cluster opens a
+  masked login field; `o` logs out.
+- **The login field never hands what is typed to anyone but ctun.** It
+  takes every key while open and the prompt none; the password and OTP
+  live in the field alone (the screen shows dots), go out in one
+  `cluster.login` request that the agent service hands to ctun's
+  `api.login` -- never to a session's worker, an event, a log, the input
+  history or an error text -- and a command an agent runs cannot send it.
+  When a cluster tool finds no login, a NEEDS-YOU item opens the same
+  field; it cannot be answered with text, since an answer goes to the
+  model, and the login closes it.
+- **`/jobs` shows everything that runs in the background, grouped**: the
+  agents' shells, watches, sub-agents and wake-ups per session, DELFIN's
+  job monitor, and the active jobs on each logged-in cluster -- also the
+  ones submitted by hand. A source that cannot be read is named, never
+  shown as empty. `/jobs` with an argument is still the session's.
+- Everything these screens show from elsewhere (a job name from a
+  cluster, a watch file in a workspace) is cut to one printable line: no
+  escape sequence reaches the terminal. cluster-tunnel is required from
+  0.8.0 (its login with the caller's credentials).
+
+### Added — DELFIN installs itself on a cluster, per commit and only published ones
+
+- **The commit the PC runs is installed on a cluster beside the others**
+  (`delfin.remote.install`): `git archive` of exactly that commit goes over
+  the tunnel into `~/delfin/installs/<commit>/` and `install_delfin.sh`
+  runs there detached, so it outlives the tunnel; ORCA, OpenMPI and the
+  tools are found or built once and shared. Changes in the PC's working
+  tree do not travel, and the result says so.
+- **Only a published commit is installed unasked**: one that lies on a
+  branch of an install source (`remote.install_sources`, ComPlat/DELFIN
+  unless the settings add a fork). Reachability, not "the server knows the
+  hash": GitHub serves any commit of a fork network by its hash.
+- **Unused installs are removed, used ones kept**: DELFIN's installs (only
+  directories it marked) that no queued or running job names
+  (`--comment=delfin-commit=<sha>`) can be removed; every install and
+  removal is in the audit log.
+- Measured on kcist, 2026-10-20: DELFIN 1.3.3 with its own Python 3.11
+  (the system's 3.10 cannot create a venv there), ORCA 6.1.1 from `$HOME`,
+  OpenMPI 4.1.8 built from source and every standard tool but std2, which
+  needs gfortran. A tool that fails is a warning of a complete install; no
+  OpenMPI or a venv that does not import DELFIN is a failed one.
+
 ### Added — DELFIN knows its clusters, and only its own process reaches them
 
 - **`remote.clusters` in `~/.delfin_settings.json` names the clusters DELFIN
