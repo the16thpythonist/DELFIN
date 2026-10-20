@@ -562,6 +562,8 @@ MASKED_HOME_ENTRIES: tuple[str, ...] = (
     ".delfin/credentials.json",
     ".delfin/approval_codes",
     ".delfin/trust_store",
+    ".config/cluster-tunnel",
+    ".cache/cluster-tunnel",
 )
 
 

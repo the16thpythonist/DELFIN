@@ -200,6 +200,7 @@ _CLI_SECRET_PATTERNS: tuple[str, ...] = (
     "**/.aws/credentials", "~/.aws/credentials", "**/.npmrc", "**/.pypirc",
     "**/.pgpass", "~/.kube/**", "~/.docker/config.json",
     "~/.delfin/credentials.json", "~/.delfin/trust_store/**",
+    "~/.config/cluster-tunnel/**", "~/.cache/cluster-tunnel/**",
     "**/id_rsa", "**/id_dsa", "**/id_ecdsa", "**/id_ed25519",
 )
 
@@ -8127,6 +8128,15 @@ _DEFAULT_PATH_DENY_GLOBS: tuple[str, ...] = (
     # The account key and the pins beside it (trust_store): DELFIN's own
     # processes outside agent sessions read them, no agent route does.
     "trust_store", "trust_store/**", "**/trust_store", "**/trust_store/**",
+    # cluster-tunnel's config (ssh options and budget scripts DELFIN's own
+    # process uses, pinned host keys) and cache (the control sockets of the
+    # logged-in masters, the sessions with their budget limit): no agent
+    # route reads or writes them (delfin.remote). With the parent's name,
+    # so a checkout of the cluster-tunnel repository stays ordinary.
+    ".config/cluster-tunnel", ".config/cluster-tunnel/**",
+    "**/.config/cluster-tunnel", "**/.config/cluster-tunnel/**",
+    ".cache/cluster-tunnel", ".cache/cluster-tunnel/**",
+    "**/.cache/cluster-tunnel", "**/.cache/cluster-tunnel/**",
 )
 
 # Self-modification protection: paths that are still WRITABLE, but always
@@ -20390,6 +20400,13 @@ class _DocToolExecutor:
                 "deny-glob (.ssh/, .env, *.key, credentials, *.pem). "
                 "These are never readable, regardless of mode or confirm."
             )
+        if _in_runtime_masked_dir(resolved):
+            return (
+                f"read denied: '{label or resolved}' lies in a directory DELFIN "
+                "keeps from every agent (cluster-tunnel's state, approval "
+                "codes, the account key store). It is never readable, "
+                "regardless of mode or confirm."
+            )
 
         # A deny rule of the user's on this path, as resolved by the tool.
         _rule_refusal = _rule_denies_path(perms, "read", resolved)
@@ -27879,6 +27896,27 @@ def _home_secret_paths() -> list[str]:
     return out
 
 
+def _in_runtime_masked_dir(path) -> bool:
+    """Whether ``path`` really lies in a directory every cage masks at run
+    time (``sandbox.runtime_masked_dirs``: the approval codes, the account
+    key store, cluster-tunnel's config and control sockets), whichever
+    granted root it is reached through. The deny globs are matched against
+    the path relative to its root, so a granted ~/.config saw ctun's config
+    as plain "cluster-tunnel/config.yaml", and a glob for that name would
+    also hide every checkout of the cluster-tunnel repository. Fails
+    closed."""
+    try:
+        from delfin.agent.sandbox import runtime_masked_dirs
+        real = Path(path).expanduser().resolve()
+        for d in runtime_masked_dirs():
+            base = Path(d)
+            if real == base or base in real.parents:
+                return True
+        return False
+    except Exception:
+        return True
+
+
 def _landlock_hide_paths(write_roots) -> list[str]:
     """``_home_secret_paths()`` for a Landlock cage with these write roots.
 
@@ -28121,6 +28159,18 @@ def _agent_service_door() -> str:
         return os.path.join("/tmp", f"delfin-{os.getuid()}")
 
 
+def _ctun_doors() -> list[str]:
+    """cluster-tunnel's directories (``delfin.remote.state_dirs``): the
+    control sockets of the logged-in cluster masters, through which a
+    command would act on a cluster as the user without any login, and the
+    config whose ssh options DELFIN's own process runs with."""
+    try:
+        from delfin.remote import state_dirs
+        return state_dirs()
+    except Exception:
+        return []
+
+
 def _session_doors() -> list[str]:
     """The sockets through which a command would reach the user's sessions:
     the same set the bubblewrap process cage masks."""
@@ -28130,7 +28180,7 @@ def _session_doors() -> list[str]:
              str(home / ".ssh"),
              os.path.join(os.environ.get("TMUX_TMPDIR") or "/tmp", f"tmux-{uid}"),
              "/var/run/docker.sock", "/run/docker.sock", "/tmp/.X11-unix",
-             _agent_service_door()]
+             _agent_service_door(), *_ctun_doors()]
     agent = os.environ.get("SSH_AUTH_SOCK", "")
     if agent and os.path.basename(os.path.dirname(agent)).startswith("ssh-"):
         doors.append(os.path.dirname(agent))
@@ -28491,8 +28541,10 @@ def _announce_auto_isolation() -> None:
 # * The doors to long-lived servers outside are masked: the systemd user
 #   manager and D-Bus (/run/user/<uid>: `systemd-run --user`), running tmux
 #   and screen servers, the SSH directory (keys, and the control sockets a
-#   dashboard transfer leaves open) and the SSH agent. `crontab` and `at`
-#   cannot use their setuid helpers inside a user namespace.
+#   dashboard transfer leaves open), the SSH agent, and cluster-tunnel's
+#   directories (the control sockets of the logged-in cluster masters).
+#   `crontab` and `at` cannot use their setuid helpers inside a user
+#   namespace.
 #
 # Measured on a bwUniCluster login node, 2026-09-16: every escape above
 # ended with the command; SLURM (sbatch/squeue) keeps working inside, so
@@ -28567,6 +28619,7 @@ def _process_cage_options() -> list[str]:
         str(home / ".ssh"),
         os.path.join(os.environ.get("TMUX_TMPDIR") or "/tmp", f"tmux-{uid}"),
         _agent_service_door(),
+        *_ctun_doors(),
     ]
     agent_socket = os.environ.get("SSH_AUTH_SOCK", "")
     # OpenSSH keeps an agent's socket in a directory of its own, ssh-XXXX.
