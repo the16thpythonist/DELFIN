@@ -442,10 +442,8 @@ def _cluster_job_detail(name: str, job_id: str, settings: Optional[dict]) -> dic
         listing = _cached(("jobs", name), JOBS_PROBE_S, conn.jobs)
         if not any(str(getattr(j, "jobid", "")) == job_id for j in listing):
             return {"sections": [], "error": clean(f"{job_id} is none of your jobs on {name}", 120)}
-        shown = conn.run(["scontrol", "show", "job", "-o", job_id], timeout=30)
-        fields = parse_scontrol(shown.stdout or "") if shown.ok else {}
-        if not fields:
-            fields = _sacct_fields(conn, job_id)
+        from delfin.remote import slurm
+        fields = slurm.job_fields(conn, job_id)
         tail = []
         out = fields.get("StdOut", "")
         if fields.get("JobState", "").startswith("PENDING"):
@@ -461,36 +459,6 @@ def _cluster_job_detail(name: str, job_id: str, settings: Optional[dict]) -> dic
     except RemoteError as exc:
         return {"sections": [], "error": clean(f"{exc.code}: {exc}", 300)}
     return {"sections": _job_sections(job_id, fields, tail), "error": None}
-
-
-def parse_scontrol(text: str) -> dict[str, str]:
-    """``scontrol show job -o``'s one line as key -> value (a value may hold
-    spaces: it runs to the next ``Key=``)."""
-    line = text.strip().splitlines()[0] if text.strip() else ""
-    parts = re.split(r" (?=[A-Za-z][A-Za-z/:]*=)", line)
-    out = {}
-    for part in parts:
-        key, sep, value = part.partition("=")
-        if sep:
-            out[key] = value
-    return out
-
-
-def _sacct_fields(conn, job_id: str) -> dict[str, str]:
-    names = ["JobName", "State", "Reason", "Partition", "NNodes", "NCPUS", "AllocTRES",
-             "Submit", "Start", "Elapsed", "Timelimit", "WorkDir", "Comment"]
-    got = conn.run(["sacct", "-j", job_id, "-X", "-n", "-P", "-o", ",".join(names)], timeout=30)
-    row = (got.stdout or "").strip().splitlines()[:1] if got.ok else []
-    if not row:
-        return {}
-    values = dict(zip(names, row[0].split("|")))
-    return {"JobName": values.get("JobName", ""), "JobState": values.get("State", ""),
-            "Reason": values.get("Reason", ""), "Partition": values.get("Partition", ""),
-            "NumNodes": values.get("NNodes", ""), "NumCPUs": values.get("NCPUS", ""),
-            "AllocTRES": values.get("AllocTRES", ""), "SubmitTime": values.get("Submit", ""),
-            "StartTime": values.get("Start", ""), "RunTime": values.get("Elapsed", ""),
-            "TimeLimit": values.get("Timelimit", ""), "WorkDir": values.get("WorkDir", ""),
-            "Comment": values.get("Comment", "")}
 
 
 def _job_sections(job_id: str, f: dict[str, str], tail: list[str]) -> list[dict]:
