@@ -254,8 +254,13 @@ def _script(conn, action: str, *args: str) -> str:
 
 
 def _upload_tree(conn, commit: Commit, source: str, path: str) -> None:
-    archive = subprocess.run(["git", "-C", str(commit.checkout), "archive", "--format=tar",
-                              commit.sha], capture_output=True, check=True).stdout
+    from delfin.agent import safe_git
+    made = safe_git.run(["archive", "--format=tar", commit.sha], commit.checkout,
+                        timeout=300, text=False)
+    if made.returncode != 0:
+        raise InstallFailed(f"git archive of {commit.sha[:10]} failed: "
+                            f"{(made.stderr or b'').decode('utf-8', 'replace').strip()}")
+    archive = made.stdout
     with tempfile.TemporaryDirectory(prefix="delfin-install-") as tmp:
         tree = Path(tmp) / commit.sha
         tree.mkdir()
@@ -277,19 +282,26 @@ def _upload_tree(conn, commit: Commit, source: str, path: str) -> None:
                                 f"{(result.stderr or '').strip()}")
 
 
+# Git through safe_git: the checkout is a repository an agent's commands
+# can write, and git runs programs its own configuration names (filters,
+# fsmonitor, hooks, an ssh command) -- here with the user's rights, outside
+# every cage. safe_git.run neutralises them and never raises.
 def _git(checkout: Path, *args: str, timeout: float = 60) -> str:
-    return subprocess.run(["git", "-C", str(checkout), *args], capture_output=True,
-                          text=True, encoding="utf-8", check=True, timeout=timeout).stdout
+    from delfin.agent import safe_git
+    done = safe_git.run(list(args), checkout, timeout=timeout)
+    if done.returncode != 0:
+        raise subprocess.CalledProcessError(done.returncode, done.args, done.stdout, done.stderr)
+    return done.stdout
 
 
 def _has_commit(checkout: Path, sha: str) -> bool:
-    return subprocess.run(["git", "-C", str(checkout), "cat-file", "-e", f"{sha}^{{commit}}"],
-                          capture_output=True).returncode == 0
+    from delfin.agent import safe_git
+    return safe_git.run(["cat-file", "-e", f"{sha}^{{commit}}"], checkout).returncode == 0
 
 
 def _is_ancestor(checkout: Path, sha: str, head: str) -> bool:
-    return subprocess.run(["git", "-C", str(checkout), "merge-base", "--is-ancestor", sha, head],
-                          capture_output=True).returncode == 0
+    from delfin.agent import safe_git
+    return safe_git.run(["merge-base", "--is-ancestor", sha, head], checkout).returncode == 0
 
 
 def _audit(action: str, cluster: str, sha: str, source: str, path: str) -> None:

@@ -39,7 +39,7 @@ const CLUSTERS = [
   cluster({}),
   cluster({ name: "justus", target: "jonas@justus2.uni-ulm.de", state: "logged_in", requiresOtp: true,
             budget: { used: 120, limit: 500, unit: "h" }, jobs: 3 }),
-  cluster({ name: "horeka", target: "hk1234@horeka.scc.kit.edu", state: "refused",
+  cluster({ name: "horeka", target: "me@horeka.example", state: "refused",
             problems: ["ctun has not pinned its host key; check the fingerprint and run `ctun -t horeka hostkey --pin`",
                        "work_dir '~x' must be a directory below ~"] }),
 ]
@@ -150,7 +150,7 @@ describe("/clusters", () => {
     expect(text).toContain("◆ CLUSTERS  3 clusters · 1 logged in")
     expect(text).toMatch(/› ○ kcist\s+logged out\s+jonas@kcist\.example\.org/)
     expect(text).toMatch(/● justus\s+logged in\s+jonas@justus2\.uni-ulm\.de\s+120\/500 h  3 jobs/)
-    expect(text).toMatch(/✗ horeka\s+refused\s+hk1234@horeka\.scc\.kit\.edu/)
+    expect(text).toMatch(/✗ horeka\s+refused\s+me@horeka\.example/)
     expect(text).toContain("↑↓ select · enter log in · r refresh · esc back")
     expect(called(calls, "session.prompt")).toEqual([])
     w!.keys.pressEnter()

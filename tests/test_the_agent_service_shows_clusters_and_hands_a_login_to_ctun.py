@@ -183,7 +183,10 @@ for method in ("cluster.login", "cluster.logout"):
         out[method] = exc.code
 print(json.dumps(out))
 """
-    env = dict(service.env, DELFIN_AGENT_SESSION="12345")
+    from conftest import child_env
+    env = child_env(service.tmp)
+    env.update(DELFIN_RUNTIME_DIR=service.env["DELFIN_RUNTIME_DIR"],
+               PYTHONPATH=service.env["PYTHONPATH"], DELFIN_AGENT_SESSION="12345")
     run = subprocess.run([sys.executable, "-c", probe, str(service.socket), str(REPO), PASSWORD],
                          env=env, capture_output=True, text=True, timeout=120)
     got = json.loads(run.stdout.strip().splitlines()[-1])
