@@ -9,21 +9,28 @@
  *               wrong (a refused one's problems, an error)
  *                 ↑ ↓      select           enter / l   log in (login.tsx)
  *                 o        log out          r           ask again
- *                 esc      back
+ *                 space    details          esc         back
  *   /jobs       the agents' background work (a group per session), the
  *               jobs DELFIN's job monitor watches, and the active jobs on
  *               each logged-in cluster; a source that could not be read is
  *               said at the end, never shown as empty. Read-only.
- *                 ↑ ↓      scroll           r           ask again
- *                 esc      back
+ *                 ↑ ↓      select a job     r           ask again
+ *                 space    details          esc         back
  *
  * A screen takes the agent view's place (the whole terminal but the
  * prompt) and every key while it is open, and asks again every 5 s. The
  * service looks at the clusters over ssh (with a cache): an answer may
  * take some seconds, and "asking…" is said until the first one is in.
+ *
+ * Space shows the selected entry's details under its row (cluster.detail,
+ * job.detail: serviceVersion 5): a cluster's session, DELFIN's installs
+ * there and its host key; a job's Slurm facts, where it runs and its
+ * output's last lines. One entry's at a time, asked again with every poll
+ * while they are open -- the last answer stays until the next is in. What
+ * does not fit under the row is counted, never drawn over it.
  */
 import type { KeyEvent } from "@opentui/core"
-import { For, createEffect, onCleanup, type JSX } from "solid-js"
+import { For, batch, createEffect, onCleanup, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { Keymap } from "../keymap/keymap"
 import { oneLine } from "../store/state"
@@ -34,6 +41,9 @@ export type Screen = "clusters" | "jobs"
 
 /** The first service that answers clusters.list, cluster.login/logout and jobs.list. */
 export const CLUSTERS_SERVICE_VERSION = 4
+
+/** The first that answers cluster.detail and job.detail (space). */
+export const DETAILS_SERVICE_VERSION = 5
 
 /** How often an open screen asks the service again. */
 export const CLUSTERS_POLL_MS = 5000
@@ -61,20 +71,49 @@ export interface JobRow {
   label: string
   state: string
   detail: string
+  /** An agent's: shells, watches, agents or wakeups. */
+  group: string
 }
 
 export interface JobGroup {
   source: "agent" | "monitor" | "cluster"
   /** The session's (agent), "DELFIN's job monitor", the cluster's. */
   title: string
+  /** A cluster's name, an agent's session id: what job.detail asks with. */
+  cluster: string
+  session: string
   rows: JobRow[]
   /** A cluster's: how many of its jobs ended recently. */
   finished: number
 }
 
+/** A part of an entry's details (cluster.detail, job.detail): its title,
+ *  label and value pairs, and lines (an output tail, an indented list). */
+export interface DetailSection {
+  title: string
+  pairs: [string, string][]
+  lines: string[]
+}
+
+/** The details open under an entry's row. */
+export interface Details {
+  /** The entry's: a cluster's name, a job's jobKey. */
+  key: string
+  /** Its first answer is not in yet. */
+  loading: boolean
+  sections: DetailSection[]
+  error: string
+}
+
 /** A field as one plain line, whatever the service sent. */
 const clean = (value: unknown, max: number) =>
   oneLine(typeof value === "string" ? value : value == null ? "" : String(value), max)
+
+/** A line shown as it came (an output tail, an indented list): what
+ *  `clean` takes out taken out word by word, the spacing kept. */
+const cleanLine = (value: unknown, max: number) =>
+  (typeof value === "string" ? value : value == null ? "" : String(value))
+    .replace(/[^ ]+/g, (word) => clean(word, max)).trimEnd().slice(0, max)
 
 const STATES = new Set(["refused", "logged_out", "logged_in"])
 
@@ -108,11 +147,58 @@ export function jobGroups(raw: unknown): JobGroup[] {
   return (raw as Record<string, any>[]).filter((g) => g && typeof g === "object").map((g) => ({
     source: SOURCES.has(g.source) ? g.source : "agent",
     title: clean(g.title, 120) || clean(g.cluster, 64) || "(untitled)",
+    cluster: clean(g.cluster, 64), session: clean(g.session, 64),
     rows: (Array.isArray(g.rows) ? g.rows : []).filter((r: unknown) => r && typeof r === "object")
       .map((r: Record<string, unknown>) => ({ id: clean(r.id, 64), kind: clean(r.kind, 40), label: clean(r.label, 120),
-                                              state: clean(r.state, 24), detail: clean(r.detail, 160) })),
+                                              state: clean(r.state, 24), detail: clean(r.detail, 160),
+                                              group: clean(r.group, 16) })),
     finished: Math.max(0, Number(g.finished) || 0),
   }))
+}
+
+/** A job's identity from one answer to the next: its source, its cluster
+ *  or session, an agent's group (a shell's id and a watch's may be the
+ *  same) and its id. */
+export const jobKey = (g: JobGroup, r: JobRow): string =>
+  JSON.stringify([g.source, g.cluster || g.session, r.group, r.id])
+
+/** What job.detail is asked for a row: what its group says it is. */
+const jobAsk = (g: JobGroup, r: JobRow): Record<string, unknown> =>
+  g.source === "cluster" ? { source: "cluster", cluster: g.cluster, id: r.id }
+    : g.source === "agent" ? { source: "agent", session: g.session, group: r.group, id: r.id }
+    : { source: "monitor", id: r.id }
+
+/** The sections cluster.detail or job.detail sent, each field as its type
+ *  says; a line keeps its spacing. */
+export function detailSections(raw: unknown): DetailSection[] {
+  if (!Array.isArray(raw)) return []
+  return (raw as Record<string, any>[]).filter((s) => s && typeof s === "object").map((s) => ({
+    title: clean(s.title, 60),
+    pairs: (Array.isArray(s.pairs) ? s.pairs : []).filter(Array.isArray)
+      .map((p: unknown[]) => [clean(p[0], 40), clean(p[1], 300)] as [string, string]),
+    lines: (Array.isArray(s.lines) ? s.lines : []).map((line: unknown) => cleanLine(line, 300)),
+  }))
+}
+
+/** A line of the open details: a title, a pair, a line -- or a note
+ *  (loading…, what does not fit) or the error. */
+export interface DetailLine {
+  text: string
+  look?: "head" | "note" | "error"
+}
+
+/** The open details as lines: each section's title, its pairs (the labels
+ *  padded to the section's longest), its lines as they came. */
+export function detailLines(details: Details): DetailLine[] {
+  if (details.loading) return [{ text: "loading…", look: "note" }]
+  const out: DetailLine[] = details.error ? [{ text: details.error, look: "error" }] : []
+  for (const s of details.sections) {
+    if (s.title) out.push({ text: s.title, look: "head" })
+    const pad = Math.max(0, ...s.pairs.map(([label]) => width(label)))
+    for (const [label, value] of s.pairs) out.push({ text: `${label}${" ".repeat(pad - width(label))}  ${value}` })
+    for (const text of s.lines) out.push({ text })
+  }
+  return out.length ? out : [{ text: "no details", look: "note" }]
 }
 
 /** Why a refused cluster cannot be logged into: its first problem -- and
@@ -139,10 +225,10 @@ export interface ClustersViewState {
   groups: JobGroup[]
   /** The sources of /jobs that could not be read. */
   errors: string[]
-  /** /clusters: the selected row. */
+  /** The selected entry: a cluster (/clusters), a job of any group (/jobs). */
   selected: number
-  /** /jobs: the first line shown. */
-  scroll: number
+  /** The entry whose details are open (space), and what the service said. */
+  details: Details | null
 }
 
 export interface ClustersViewDeps {
@@ -151,6 +237,10 @@ export interface ClustersViewDeps {
   say(text: string): void
   /** Enter on a logged-out cluster: the masked login field for it. */
   login(row: ClusterRow): void
+  /** The service's version: details from DETAILS_SERVICE_VERSION on. */
+  serviceVersion(): number
+  /** How often an open screen asks again (CLUSTERS_POLL_MS; tests shorten it). */
+  pollMs?: number
 }
 
 /** A line of /jobs: a group's title, a job, a group without jobs, a source not read. */
@@ -158,27 +248,39 @@ export interface JobLine {
   kind: "title" | "row" | "empty" | "error"
   text: string
   row?: JobRow
+  /** A job's: its place among every group's jobs, and its jobKey. */
+  index?: number
+  key?: string
 }
 
 export interface ClustersView {
   state: ClustersViewState
   open(screen: Screen): void
   close(): void
-  /** Ask the service again (r, the poll, a login that went through). */
+  /** Ask the service again (r, the poll, a login that went through), and
+   *  for the open details. */
   refresh(): void
   /** A key while a screen is open; every key is its own. */
   handleKey(key: KeyEvent): boolean
   selectedRow(): ClusterRow | undefined
+  /** The selected entry's index: a cluster's, a job's among every group's
+   *  (-1: there is none). */
+  selectedAt(): number
   jobLines(): JobLine[]
-  /** The rows the screen has for its lines (↓ stops at the last one shown). */
-  setRoom(rows: number): void
+}
+
+/** An entry whose details space shows: its key (a cluster's name, a job's
+ *  jobKey) and the request that asks for them. */
+interface Entry {
+  key: string
+  method: string
+  params: Record<string, unknown>
 }
 
 export function createClustersView(deps: ClustersViewDeps): ClustersView {
   const [state, setState] = createStore<ClustersViewState>({
-    open: null, loading: false, error: "", clusters: [], groups: [], errors: [], selected: 0, scroll: 0,
+    open: null, loading: false, error: "", clusters: [], groups: [], errors: [], selected: 0, details: null,
   })
-  let room = 1
   /** The screens with a request on its way: one at a time each. One
    *  asked for meanwhile (r, a login that went through) goes after it; the
    *  poll's waits for its next turn. */
@@ -187,9 +289,16 @@ export function createClustersView(deps: ClustersViewDeps): ClustersView {
 
   const open = (screen: Screen) => {
     if (state.open === screen) return refresh()
-    setState({ open: screen, loading: true, error: "", clusters: [], groups: [], errors: [], selected: 0, scroll: 0 })
+    setState({ open: screen, loading: true, error: "", clusters: [], groups: [], errors: [], selected: 0, details: null })
   }
-  const close = () => setState({ open: null })
+  const close = () => setState({ open: null, details: null })
+
+  /** The open screen's entries, in the order shown. */
+  const entries = (): Entry[] => state.open === "jobs"
+    ? state.groups.flatMap((g) => g.rows.map((r) => ({ key: jobKey(g, r), method: "job.detail", params: jobAsk(g, r) })))
+    : state.clusters.map((row) => ({ key: row.name, method: "cluster.detail", params: { name: row.name } }))
+  const count = () => state.open === "jobs" ? state.groups.reduce((n, g) => n + g.rows.length, 0) : state.clusters.length
+  const selectedAt = () => Math.min(state.selected, count() - 1)
 
   const ask = (queue: boolean) => {
     const screen = state.open
@@ -201,11 +310,20 @@ export function createClustersView(deps: ClustersViewDeps): ClustersView {
     asking.add(screen)
     void deps.request(screen === "clusters" ? "clusters.list" : "jobs.list", {}).then((got) => {
       if (state.open !== screen) return
-      if (screen === "clusters") setState({ clusters: clusterRows(got?.clusters), loading: false, error: "" })
-      else {
-        setState({ groups: jobGroups(got?.groups), loading: false, error: "",
-                   errors: (Array.isArray(got?.errors) ? got.errors : []).map((e: unknown) => clean(e, 300)).filter(Boolean) })
-      }
+      const was = entries()[selectedAt()]?.key
+      batch(() => {
+        if (screen === "clusters") setState({ clusters: clusterRows(got?.clusters), loading: false, error: "" })
+        else {
+          setState({ groups: jobGroups(got?.groups), loading: false, error: "",
+                     errors: (Array.isArray(got?.errors) ? got.errors : []).map((e: unknown) => clean(e, 300)).filter(Boolean) })
+        }
+        // The selection stays on its entry (else as near to where it was
+        // as the list allows); details whose entry is gone close.
+        const keys = entries().map((e) => e.key)
+        const at = was === undefined ? -1 : keys.indexOf(was)
+        setState({ selected: at >= 0 ? at : Math.max(0, Math.min(state.selected, keys.length - 1)) })
+        if (state.details && !keys.includes(state.details.key)) setState({ details: null })
+      })
     }, (error) => {
       if (state.open === screen) setState({ loading: false, error: clean((error as Error)?.message ?? error, 300) })
     }).finally(() => {
@@ -213,12 +331,51 @@ export function createClustersView(deps: ClustersViewDeps): ClustersView {
       if (again.delete(screen) && state.open === screen) refresh()
     })
   }
-  const refresh = () => ask(true)
-  // While a screen is open: asked now, then every 5 s.
+
+  /** The open details' request on its way (its entry's key): one at a
+   *  time. The last answer stays on the screen until the next is in; one
+   *  for an entry no longer open is let go. */
+  let detailsAsking: { key: string } | null = null
+  const askDetails = () => {
+    const key = state.details?.key
+    const entry = key === undefined ? undefined : entries().find((e) => e.key === key)
+    if (!entry || detailsAsking?.key === entry.key) return
+    const mine = { key: entry.key }
+    detailsAsking = mine
+    const answer = (sections: DetailSection[], error: string) => {
+      if (state.details?.key === entry.key) setState("details", { loading: false, sections, error })
+    }
+    void deps.request(entry.method, entry.params).then(
+      (got) => answer(detailSections(got?.sections), clean(got?.error, 300)),
+      (error) => answer([], clean((error as Error)?.message ?? error, 300)),
+    ).finally(() => {
+      if (detailsAsking === mine) detailsAsking = null
+    })
+  }
+  /** Space: the selected entry's details under its row, asked for now --
+   *  or closed, when they are its already. */
+  const toggleDetails = () => {
+    if (deps.serviceVersion() < DETAILS_SERVICE_VERSION) return deps.say("restart the agent service to see details")
+    const entry = entries()[selectedAt()]
+    if (!entry) return
+    if (state.details?.key === entry.key) return setState({ details: null })
+    setState({ details: { key: entry.key, loading: true, sections: [], error: "" } })
+    askDetails()
+  }
+
+  const refresh = () => {
+    ask(true)
+    askDetails()
+  }
+  // While a screen is open: asked now, then every 5 s (and its open
+  // details with it).
   createEffect(() => {
     if (!state.open) return
     ask(false)
-    const timer = setInterval(() => ask(false), CLUSTERS_POLL_MS)
+    const timer = setInterval(() => {
+      ask(false)
+      askDetails()
+    }, deps.pollMs ?? CLUSTERS_POLL_MS)
     ;(timer as { unref?: () => void }).unref?.()
     onCleanup(() => clearInterval(timer))
   })
@@ -227,10 +384,11 @@ export function createClustersView(deps: ClustersViewDeps): ClustersView {
 
   const jobLines = (): JobLine[] => {
     const out: JobLine[] = []
+    let index = 0
     for (const g of state.groups) {
       const finished = g.source === "cluster" && g.finished > 0 ? ` · ${g.finished} finished recently` : ""
       out.push({ kind: "title", text: g.title + finished })
-      for (const row of g.rows) out.push({ kind: "row", text: row.label, row })
+      for (const row of g.rows) out.push({ kind: "row", text: row.label, row, index: index++, key: jobKey(g, row) })
       if (!g.rows.length) out.push({ kind: "empty", text: g.source === "cluster" ? "no active jobs" : "nothing running" })
     }
     if (!state.groups.length && !state.errors.length) out.push({ kind: "empty", text: "nothing runs in the background" })
@@ -260,13 +418,15 @@ export function createClustersView(deps: ClustersViewDeps): ClustersView {
       return true
     }
     if (key.name === "up" || key.name === "down") {
+      // Entry by entry, around at the ends: /jobs steps over the groups'
+      // titles and what could not be read.
       const step = key.name === "up" ? -1 : 1
-      if (state.open === "jobs") {
-        setState({ scroll: Math.max(0, Math.min(state.scroll + step, jobLines().length - room)) })
-      } else if (state.clusters.length) {
-        const n = state.clusters.length
-        setState({ selected: (Math.min(state.selected, n - 1) + step + n) % n })
-      }
+      const n = count()
+      if (n) setState({ selected: (Math.min(state.selected, n - 1) + step + n) % n })
+      return true
+    }
+    if (key.name === "space" && plain) {
+      toggleDetails()
       return true
     }
     if (letter === "r") {
@@ -288,16 +448,15 @@ export function createClustersView(deps: ClustersViewDeps): ClustersView {
     return true                           // nothing else leaves the screen
   }
 
-  return { state, open, close, refresh, handleKey, selectedRow, jobLines,
-           setRoom: (rows) => { room = Math.max(1, rows) } }
+  return { state, open, close, refresh, handleKey, selectedRow, selectedAt, jobLines }
 }
 
 /** The hints line while a screen is open: what its keys do now. */
 export function clustersHelp(view: ClustersView, room = Infinity): string {
   const row = view.state.open === "clusters" ? view.selectedRow() : undefined
-  const parts = view.state.open === "jobs" ? ["↑↓ scroll", "r refresh", "esc back"]
+  const parts = view.state.open === "jobs" ? ["↑↓ select", "space details", "r refresh", "esc back"]
     : ["↑↓ select", row?.state === "logged_out" ? "enter log in" : row?.state === "logged_in" ? "o log out" : "",
-       "r refresh", "esc back"].filter(Boolean)
+       "space details", "r refresh", "esc back"].filter(Boolean)
   const kept: string[] = []
   for (const part of parts) {
     if (width([...kept, part].join(" · ")) > room) break
@@ -325,6 +484,7 @@ interface Line {
   row?: ClusterRow
   job?: JobRow
   index?: number
+  look?: DetailLine["look"]
 }
 
 export function ClustersPanel(props: { view: ClustersView; theme: () => Theme; width: () => number;
@@ -335,33 +495,49 @@ export function ClustersPanel(props: { view: ClustersView; theme: () => Theme; w
   const room = () => Math.max(1, props.height() - 1)
   const lines = (): Line[] => {
     const out: Line[] = []
-    const add = (kind: Line["kind"], text: string) => out.push({ kind, text })
+    const add = (kind: Line["kind"], text: string, look?: Line["look"]) => out.push({ kind, text, look })
+    /** Under an entry's row: what the selected one says (`said`), then its
+     *  details while they are open -- as many lines as fit under the row
+     *  at the top of the screen, the last of them saying how many more. */
+    const under = (key: string, said: string[]) => {
+      const details = v.state.details?.key === key ? detailLines(v.state.details) : []
+      const shown: DetailLine[] = [...said.map((text) => ({ text })), ...details]
+      const space = Math.max(1, room() - 1)
+      const kept = shown.length > space ? space - 1 : shown.length
+      for (const l of shown.slice(0, kept)) add("detail", l.text, l.look)
+      const more = shown.length - kept
+      if (more) add("detail", `… ${more} more line${more === 1 ? "" : "s"}`, "note")
+    }
     if (v.state.loading) add("empty", "asking the agent service… (it looks at each cluster over ssh)")
     else if (v.state.error) add("error", `the agent service did not answer: ${v.state.error}`)
+    const at = v.selectedAt()
     if (v.state.open === "jobs") {
       if (!v.state.loading && !v.state.error) {
         for (const l of v.jobLines()) {
-          if (l.kind === "row") out.push({ kind: "job", text: l.text, job: l.row })
-          else add(l.kind, l.text)
+          if (l.kind !== "row") add(l.kind, l.text)
+          else {
+            out.push({ kind: "job", text: l.text, job: l.row, index: l.index })
+            under(l.key!, [])
+          }
         }
       }
-      v.setRoom(room())
-      const first = Math.max(0, Math.min(v.state.scroll, out.length - room()))
-      return out.slice(first, first + room())
+    } else {
+      if (!v.state.loading && !v.state.error && !v.state.clusters.length) {
+        add("empty", "no clusters: remote.clusters in DELFIN's settings names none")
+      }
+      v.state.clusters.forEach((row, index) => {
+        out.push({ kind: "row", text: row.name, row, index })
+        // The short lines step aside while the full details are open (a
+        // refused cluster's would say its problems twice).
+        under(row.name, index === at && v.state.details?.key !== row.name ? detailOf(row) : [])
+      })
     }
-    if (!v.state.loading && !v.state.error && !v.state.clusters.length) {
-      add("empty", "no clusters: remote.clusters in DELFIN's settings names none")
-    }
-    const at = Math.min(v.state.selected, v.state.clusters.length - 1)
-    v.state.clusters.forEach((row, index) => {
-      out.push({ kind: "row", text: row.name, row, index })
-      if (index === at) for (const text of detailOf(row)) add("detail", text)
-    })
-    // The selection and what it says in view.
+    // The selection and what is under it in view -- the row itself always.
     const sel = out.findIndex((l) => l.index === at)
-    const end = sel + 1 + out.slice(sel + 1).filter((l) => l.kind === "detail").length
+    let end = sel + 1
+    while (out[end]?.kind === "detail") end++
     let first = Math.max(0, Math.min(sel - Math.floor(room() / 3), out.length - room()))
-    if (end - first > room()) first = end - room()
+    if (end - first > room()) first = Math.min(sel, end - room())
     return out.slice(Math.max(0, first), Math.max(0, first) + room())
   }
   const summary = () => {
@@ -378,6 +554,8 @@ export function ClustersPanel(props: { view: ClustersView; theme: () => Theme; w
   const tone = (state: ClusterRow["state"]) => state === "logged_in" ? t().ok : state === "refused" ? t().err : t().muted
   const stateTone = (state: string) => /fail|error|cancel|timeout|memory|kill/i.test(state) ? t().err
     : /run|complet/i.test(state) ? t().ok : /pend|queue|wait/i.test(state) ? t().warn : t().muted
+  const detailTone = (look: Line["look"]) => look === "head" ? t().text : look === "note" ? t().faint
+    : look === "error" ? t().err : t().muted
   return (
     <box flexDirection="column" height={props.height()} flexShrink={0}>
       <text wrapMode="none">
@@ -389,7 +567,15 @@ export function ClustersPanel(props: { view: ClustersView; theme: () => Theme; w
           if (line.kind === "title") return <text fg={t().accentSoft} wrapMode="none">{fit(` ${line.text}`, inner())}</text>
           if (line.kind === "empty") return <text fg={t().faint} wrapMode="none">{fit(`   ${line.text}`, inner())}</text>
           if (line.kind === "error") return <text fg={t().err} wrapMode="none">{fit(`   ✗ ${line.text}`, inner())}</text>
-          if (line.kind === "detail") return <text fg={t().muted} wrapMode="none">{`      │ ${fit(line.text, inner() - 8)}`}</text>
+          if (line.kind === "detail") {
+            return (
+              <text wrapMode="none">
+                <span style={{ fg: t().muted }}>{"      │ "}</span>
+                <span style={{ fg: detailTone(line.look), bold: line.look === "head" }}>{fit(line.text, inner() - 8)}</span>
+              </text>
+            )
+          }
+          const on = line.index === v.selectedAt()
           if (line.kind === "job") {
             const job = line.job!
             const kind = fit(job.kind, 10).padEnd(10)
@@ -399,15 +585,15 @@ export function ClustersPanel(props: { view: ClustersView; theme: () => Theme; w
             const detail = fit(job.detail, Math.max(0, inner() - 3 - 10 - 2 - room - 2 - 12 - 2))
             return (
               <text wrapMode="none">
-                <span style={{ fg: t().muted }}>{"   " + kind + "  "}</span>
-                <span style={{ fg: t().text }}>{label + " ".repeat(Math.max(0, room - width(label)))}</span>
+                <span style={{ fg: on ? t().accent : t().faint }}>{on ? " › " : "   "}</span>
+                <span style={{ fg: t().muted }}>{kind + "  "}</span>
+                <span style={{ fg: on ? t().bright : t().text, bold: on }}>{label + " ".repeat(Math.max(0, room - width(label)))}</span>
                 <span style={{ fg: stateTone(job.state) }}>{"  " + state.padEnd(12)}</span>
                 <span style={{ fg: t().faint }}>{detail ? "  " + detail : ""}</span>
               </text>
             )
           }
           const row = line.row!
-          const on = line.index === Math.min(v.state.selected, v.state.clusters.length - 1)
           const look = LOOK[row.state]
           const right = [budgetText(row.budget), row.jobs === null ? "" : `${row.jobs} job${row.jobs === 1 ? "" : "s"}`]
             .filter(Boolean).join("  ")

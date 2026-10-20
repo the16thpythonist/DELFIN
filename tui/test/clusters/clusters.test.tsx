@@ -2,19 +2,21 @@
  * /clusters, /jobs and the masked login field, in the window: the screens
  * ask the agent service (clusters.list, jobs.list) and say what it
  * answered -- three states of a cluster, groups of background work, the
- * sources it could not read. Enter on a logged-out cluster opens the
- * login field, whose text is drawn as • and goes out in exactly one
- * cluster.login: never into the prompt, the input history, a session's
- * prompt, a question's answer or an attention item's answer, nor onto the
- * screen. A login item of NEEDS YOU opens the same field. Rendered
- * headless through the real App against a fake agent service.
+ * sources it could not read. ↑ ↓ select an entry on either screen, and
+ * space shows its details under its row (cluster.detail, job.detail),
+ * asked again with every poll while open. Enter on a logged-out cluster
+ * opens the login field, whose text is drawn as • and goes out in exactly
+ * one cluster.login: never into the prompt, the input history, a
+ * session's prompt, a question's answer or an attention item's answer, nor
+ * onto the screen. A login item of NEEDS YOU opens the same field.
+ * Rendered headless through the real App against a fake agent service.
  */
 import { afterEach, describe, expect, test } from "bun:test"
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { attentionCounts, markOf } from "../../src/agents/attention"
-import { clusterRows, jobGroups, refusal } from "../../src/clusters/view"
+import { clusterRows, detailLines, detailSections, jobGroups, refusal } from "../../src/clusters/view"
 import { History } from "../../src/composer/history"
 import type { AttentionItem } from "../../src/protocol/generated"
 import { emptyState } from "../../src/store/state"
@@ -54,6 +56,53 @@ const JOBS = {
   ],
   errors: ["kcist: tunnel_down: the control socket does not answer"],
 }
+/** /jobs as a version-5 service sends it: an agent group names its
+ *  session, an agent row its group. */
+const JOBS5: { groups: Record<string, any>[]; errors: string[] } = {
+  groups: [
+    { source: "agent", session: "sess-7", title: "optimise benzene", rows: [
+      { id: "bg-1", kind: "Shell", label: "orca opt.inp", state: "", detail: "running · 4m", group: "shells" },
+      { id: "w-1", kind: "Watch", label: "job 4711", state: "", detail: "running · 2m", group: "watches" }] },
+    { source: "monitor", title: "DELFIN's job monitor", rows: [
+      { id: "4711", kind: "SLURM", label: "~/calc/benzene", state: "RUNNING", detail: "watched by DELFIN's job monitor" }] },
+    { source: "cluster", cluster: "kcist", title: "kcist (jonas@kcist.example.org)", finished: 0, rows: [
+      { id: "99001", kind: "cpu", label: "scan_01", state: "RUNNING", detail: "0:10:00 of 2:00:00 · 1 node(s)" },
+      { id: "99002", kind: "cpu", label: "scan_02", state: "PENDING", detail: "0:00 of 2:00:00 · 1 node(s)" }] },
+  ],
+  errors: [],
+}
+/** JOBS5 without the rows of these ids. */
+const jobsWithout = (...ids: string[]) => ({
+  ...JOBS5, groups: JOBS5.groups.map((g) => ({ ...g, rows: g.rows.filter((r: Record<string, any>) => !ids.includes(r.id)) })),
+})
+const JOB_DETAIL = {
+  sections: [
+    { title: "Slurm", pairs: [["Job", "99001 scan_01"], ["State", "RUNNING"], ["Resources", "1 node(s), 8 CPUs"]], lines: [] },
+    { title: "Where it runs", pairs: [["Work dir", "/scratch/jonas/scan_01"],
+                                      ["Output", "/scratch/jonas/scan_01/slurm-99001.out"]], lines: [] },
+    { title: "Output, last 20 lines", pairs: [], lines: ["SCF ITERATIONS", "  ITER       Energy", "     1   -230.1234567"] },
+  ],
+  error: null,
+}
+const CLUSTER_DETAIL = {
+  sections: [
+    { title: "Session", pairs: [["Target", "jonas@kcist.example.org"], ["Login", "nobody is logged in"],
+                                ["Work dir", "~/delfin"], ["Install root", "~/delfin/installs"], ["Partition", "cpu"]],
+      lines: [] },
+    { title: "DELFIN on it", pairs: [], lines: ["3f2a9c1b7d4e  complete  ← this PC's commit", "    lacks: xtb (not on PATH)"] },
+    { title: "Host key", pairs: [["Presented", "ssh-ed25519 SHA256:pinnedkey"], ["Pinned", "SHA256:pinnedkey"],
+                                 ["Verdict", "the server presents the pinned key"]], lines: [] },
+  ],
+  error: null,
+}
+/** What the fake service tells of an entry, by what it is. */
+const detailFor = (method: string, params: Record<string, any>) =>
+  method === "cluster.detail" ? CLUSTER_DETAIL
+    : params.source === "cluster" ? JOB_DETAIL
+    : params.source === "agent" ? { sections: [{ title: "Output, last 20 lines", pairs: [],
+                                                 lines: ["$ orca opt.inp", "   ORCA 6.0   running"] }], error: null }
+    : { sections: [{ title: "Watched", pairs: [["Job", params.id], ["Folder", "~/calc/benzene"], ["Last state", "RUNNING"]],
+                     lines: [] }], error: null }
 
 const loginItem: AttentionItem = {
   id: "att-l", kind: "login", group: "needs", blocking: false, name: "log in to kcist",
@@ -63,7 +112,9 @@ const loginItem: AttentionItem = {
 }
 
 async function mount(options: { version?: number; clusters?: Record<string, unknown>[];
-                                login?: (params: Record<string, any>) => unknown } = {}) {
+                                login?: (params: Record<string, any>) => unknown;
+                                jobs?: () => unknown; detail?: (method: string, params: Record<string, any>) => unknown;
+                                pollMs?: number } = {}) {
   const calls: Call[] = []
   const dir = mkdtempSync(join(tmpdir(), "delfin-clusters-"))
   dirs.push(dir)
@@ -73,7 +124,8 @@ async function mount(options: { version?: number; clusters?: Record<string, unkn
     request: async (method: string, params: Record<string, any> = {}) => {
       calls.push({ method, params })
       if (method === "clusters.list") return { clusters: options.clusters ?? CLUSTERS }
-      if (method === "jobs.list") return JOBS
+      if (method === "jobs.list") return options.jobs?.() ?? JOBS
+      if (method === "cluster.detail" || method === "job.detail") return (options.detail ?? detailFor)(method, params)
       if (method === "cluster.login") return options.login?.(params) ?? { ok: true, opened: true, code: null, error: null }
       if (method === "cluster.logout") return { ok: true, closed: true, code: null, error: null }
       if (method === "sessions.list") return { sessions: [{ sessionId: "s1", state: "idle" }], elsewhere: [] }
@@ -82,7 +134,7 @@ async function mount(options: { version?: number; clusters?: Record<string, unkn
       return { accepted: true, applied: true, message: "" }
     },
   }
-  w = await mountWindow({ width: 110, height: 30, full: true, client, history })
+  w = await mountWindow({ width: 110, height: 30, full: true, client, history, clustersPollMs: options.pollMs })
   w.store.update((d) => { d.serviceVersion = options.version ?? 4 })
   await w.settle()
   return { w, calls, history, historyFile }
@@ -132,6 +184,15 @@ describe("reading what the service sends", () => {
       .toBe("horeka cannot be logged into: the host key changed (ctun -t horeka hostkey --pin)")
   })
 
+  test("an entry's details, each field as its type says: one plain line each, a line's spacing kept", () => {
+    const sections = detailSections([{ title: "Out\nput", pairs: [["Work\u001b[2Jdir", "a\nb"], "x", ["Id", 7]],
+                                       lines: ["  ITER\t1", "\u001b[31mred\u001b[0m  x", 5] }, null])
+    expect(sections).toEqual([{ title: "Out put", pairs: [["Work [2Jdir", "a b"], ["Id", "7"]],
+                                lines: ["  ITER 1", "[31mred [0m  x", "5"] }])
+    expect(detailLines({ key: "k", loading: false, sections, error: "" }).map((l) => l.text))
+      .toEqual(["Out put", "Work [2Jdir  a b", `Id${" ".repeat(11)}7`, "  ITER 1", "[31mred [0m  x", "5"])
+  })
+
   test("a login item waits for the user: marked and counted as one that asks", () => {
     expect(markOf(loginItem)).toBe("asks")
     const state = emptyState()
@@ -151,7 +212,7 @@ describe("/clusters", () => {
     expect(text).toMatch(/› ○ kcist\s+logged out\s+jonas@kcist\.example\.org/)
     expect(text).toMatch(/● justus\s+logged in\s+jonas@justus2\.uni-ulm\.de\s+120\/500 h  3 jobs/)
     expect(text).toMatch(/✗ horeka\s+refused\s+me@horeka\.example/)
-    expect(text).toContain("↑↓ select · enter log in · r refresh · esc back")
+    expect(text).toContain("↑↓ select · enter log in · space details · r refresh · esc back")
     expect(called(calls, "session.prompt")).toEqual([])
     w!.keys.pressEnter()
     await w!.settle()
@@ -187,7 +248,7 @@ describe("/clusters", () => {
     await settled()
     w!.keys.pressArrow("down")
     await w!.settle()
-    expect(screen()).toContain("↑↓ select · o log out · r refresh · esc back")
+    expect(screen()).toContain("↑↓ select · o log out · space details · r refresh · esc back")
     await type("o")
     await settled()
     expect(called(calls, "cluster.logout")).toEqual([{ name: "justus" }])
@@ -384,12 +445,12 @@ describe("/jobs", () => {
     expect(called(calls, "session.prompt")).toEqual([])
     const text = screen()
     expect(text).toContain("◆ JOBS  3 jobs · 1 not read")
-    expect(text).toMatch(/ optimise benzene\s*\n\s+bash\s+orca opt\.inp\s+started 4m ago/)
+    expect(text).toMatch(/ optimise benzene\s*\n › bash\s+orca opt\.inp\s+started 4m ago/)        // selected
     expect(text).toMatch(/ DELFIN's job monitor\s*\n\s+SLURM\s+~\/calc\/benzene\s+RUNNING\s+watched by DELFIN's job monitor/)
     expect(text).toMatch(/ justus \(jonas@justus2\.uni-ulm\.de\) · 2 finished recently\s*\n\s+cpu\s+scan_01\s+PENDING\s+0:00 of 2:00:00/)
     expect(text).toMatch(/ could not be read\s*\n\s+✗ kcist: tunnel_down: the control socket does not answer/)
     expect(text.indexOf("optimise benzene")).toBeLessThan(text.indexOf("could not be read"))
-    expect(text).toContain("↑↓ scroll · r refresh · esc back")
+    expect(text).toContain("↑↓ select · space details · r refresh · esc back")
     await w!.escape()
     expect(screen()).not.toContain("◆ JOBS")
   })
@@ -399,6 +460,209 @@ describe("/jobs", () => {
     await line("/jobs watch on")
     expect(called(calls, "session.prompt").map((p) => p.text)).toEqual(["/jobs watch on"])
     expect(called(calls, "jobs.list")).toEqual([])
+  })
+})
+
+describe("space: an entry's details", () => {
+  /** The highlighted rows on the screen. */
+  const selected = () => w!.screenLines().filter((l) => l.startsWith(" › "))
+  /** What is drawn under the row that shows `label`: its detail lines, without the │. */
+  const under = (label: string) => {
+    const lines = w!.screenLines()
+    const at = lines.findIndex((l) => /^ [› ] \S/.test(l) && l.includes(label))
+    expect(at).toBeGreaterThanOrEqual(0)                             // the row is on the screen
+    const out: string[] = []
+    for (let i = at + 1; lines[i]?.startsWith("      │ "); i++) out.push(lines[i]!.slice(8).trimEnd())
+    return out
+  }
+  const down = async (n = 1) => {
+    for (let i = 0; i < n; i++) {
+      w!.keys.pressArrow("down")
+      await w!.settle()
+    }
+  }
+  const space = async () => {
+    w!.keys.pressKey(" ")
+    await settled()
+  }
+  /** Until `done` holds (a poll's turn), for two seconds at most. */
+  const until = async (done: () => boolean) => {
+    for (let i = 0; i < 80 && !done(); i++) {
+      await Bun.sleep(25)
+      await w!.settle()
+    }
+  }
+
+  test("↓ walks /jobs job by job across the groups -- never onto a title or what was not read -- and around", async () => {
+    await mount({ version: 5, jobs: () => ({ ...JOBS5, errors: ["horeka: tunnel_down: the control socket does not answer"] }) })
+    await line("/jobs")
+    await settled()
+    const walk = [selected()]
+    for (let i = 0; i < 5; i++) {
+      await down()
+      walk.push(selected())
+    }
+    expect(walk.map((marked) => marked.length)).toEqual([1, 1, 1, 1, 1, 1])        // one at a time
+    expect(walk.map(([l]) => /^ › (\S+)\s+(orca opt\.inp|job 4711|~\/calc\/benzene|scan_0\d)/.exec(l!)?.slice(1)))
+      .toEqual([["Shell", "orca opt.inp"], ["Watch", "job 4711"], ["SLURM", "~/calc/benzene"], ["cpu", "scan_01"],
+                ["cpu", "scan_02"], ["Shell", "orca opt.inp"]])
+    w!.keys.pressArrow("up")                                         // and back around
+    await w!.settle()
+    expect(selected()[0]).toContain("scan_02")
+    expect(screen()).toContain("✗ horeka: tunnel_down")
+    expect(screen()).toContain("↑↓ select · space details · r refresh · esc back")
+  })
+
+  test("space asks job.detail for what its row is, and draws the sections under it; on another row they move there", async () => {
+    const { calls } = await mount({ version: 5, jobs: () => JOBS5 })
+    await line("/jobs")
+    await settled()
+    await space()                                                    // the agent's shell
+    expect(called(calls, "job.detail")).toEqual([{ source: "agent", session: "sess-7", group: "shells", id: "bg-1" }])
+    expect(under("orca opt.inp")).toEqual(["Output, last 20 lines", "$ orca opt.inp", "   ORCA 6.0   running"])
+    await down(2)
+    await space()                                                    // the monitor's
+    expect(called(calls, "job.detail")[1]).toEqual({ source: "monitor", id: "4711" })
+    expect(under("orca opt.inp")).toEqual([])                        // one entry's at a time
+    expect(under("~/calc/benzene")).toEqual(["Watched", "Job         4711", "Folder      ~/calc/benzene",
+                                             "Last state  RUNNING"])
+    await down()
+    await space()                                                    // a job on a cluster
+    expect(called(calls, "job.detail")[2]).toEqual({ source: "cluster", cluster: "kcist", id: "99001" })
+    expect(under("~/calc/benzene")).toEqual([])
+    expect(under("scan_01")).toEqual([
+      "Slurm",
+      "Job        99001 scan_01",
+      "State      RUNNING",
+      "Resources  1 node(s), 8 CPUs",
+      "Where it runs",
+      "Work dir  /scratch/jonas/scan_01",
+      "Output    /scratch/jonas/scan_01/slurm-99001.out",
+      "Output, last 20 lines",
+      "SCF ITERATIONS",
+      "  ITER       Energy",
+      "     1   -230.1234567",
+    ])
+    expect(called(calls, "job.detail")).toHaveLength(3)
+    // esc closes the screen and them with it: opened again, none are open.
+    await w!.escape()
+    await line("/jobs")
+    await settled()
+    expect(selected()[0]).toContain("orca opt.inp")
+    expect(screen()).not.toContain("│ Slurm")
+    expect(called(calls, "session.prompt")).toEqual([])
+  })
+
+  test("space again closes them; while open, each poll asks again and the last answer stays until the next is in", async () => {
+    let asked = 0
+    const later = { sections: [{ title: "Slurm", pairs: [["State", "COMPLETING"]], lines: [] }], error: null }
+    const { calls } = await mount({ version: 5, jobs: () => JOBS5, pollMs: 150, detail: () =>
+      ++asked === 1 ? JOB_DETAIL : new Promise((resolve) => setTimeout(() => resolve(later), 300)) })
+    await line("/jobs")
+    await settled()
+    await down(3)
+    await space()
+    expect(under("scan_01")[1]).toBe("Job        99001 scan_01")
+    await until(() => called(calls, "job.detail").length === 2)      // the poll's
+    expect(called(calls, "job.detail")).toHaveLength(2)
+    expect(under("scan_01")[1]).toBe("Job        99001 scan_01")     // the last answer, not "loading…"
+    await until(() => under("scan_01").length === 2)
+    expect(under("scan_01")).toEqual(["Slurm", "State  COMPLETING"])
+    await space()
+    expect(under("scan_01")).toEqual([])
+    const details = called(calls, "job.detail").length
+    const lists = called(calls, "jobs.list").length
+    await Bun.sleep(500)
+    await settled()
+    expect(called(calls, "jobs.list").length).toBeGreaterThan(lists)  // the polls went on
+    expect(called(calls, "job.detail")).toHaveLength(details)         // without the details
+  })
+
+  test("the selection stays on its job when a row above it leaves; when the job leaves, on the one in its place", async () => {
+    let answer = JOBS5
+    await mount({ version: 5, jobs: () => answer })
+    await line("/jobs")
+    await settled()
+    await down(3)
+    expect(selected()[0]).toContain("scan_01")
+    await space()
+    answer = jobsWithout("bg-1")                                     // the agent's shell ended
+    await type("r")
+    await settled()
+    expect(selected()).toHaveLength(1)
+    expect(selected()[0]).toContain("scan_01")
+    expect(under("scan_01")[0]).toBe("Slurm")                        // its details with it
+    answer = jobsWithout("bg-1", "99001")                            // and then scan_01
+    await type("r")
+    await settled()
+    expect(selected()[0]).toContain("scan_02")
+    expect(screen()).not.toContain("│ Slurm")                        // closed with it
+  })
+
+  test("/clusters: space asks cluster.detail and draws it under the row; enter still opens the login field", async () => {
+    const { calls } = await mount({ version: 5 })
+    await line("/clusters")
+    await settled()
+    expect(screen()).toContain("↑↓ select · enter log in · space details · r refresh · esc back")
+    await space()
+    expect(called(calls, "cluster.detail")).toEqual([{ name: "kcist" }])
+    expect(screen()).not.toContain("log in to kcist")                // space never opens it
+    expect(under("kcist")).toEqual([
+      "Session",
+      "Target        jonas@kcist.example.org",
+      "Login         nobody is logged in",
+      "Work dir      ~/delfin",
+      "Install root  ~/delfin/installs",
+      "Partition     cpu",
+      "DELFIN on it",
+      "3f2a9c1b7d4e  complete  ← this PC's commit",
+      "    lacks: xtb (not on PATH)",
+      "Host key",
+      "Presented  ssh-ed25519 SHA256:pinnedkey",
+      "Pinned     SHA256:pinnedkey",
+      "Verdict    the server presents the pinned key",
+    ])
+    w!.keys.pressEnter()
+    await w!.settle()
+    expect(screen()).toContain("log in to kcist")
+    expect(screen()).toMatch(/› password\s+▏/)
+    expect(called(calls, "cluster.login")).toEqual([])
+  })
+
+  test("details taller than the room under the row end with how many more lines there are; the row stays in view", async () => {
+    const tail = Array.from({ length: 40 }, (_, i) => `line ${i + 1}`)
+    await mount({ version: 5, jobs: () => JOBS5,
+                  detail: () => ({ sections: [{ title: "Output, last 40 lines", pairs: [], lines: tail }], error: null }) })
+    await line("/jobs")
+    await settled()
+    w!.keys.pressArrow("up")                                         // around to the last job
+    await w!.settle()
+    await space()
+    const lines = w!.screenLines()
+    expect(lines[0]).toContain("◆ JOBS")
+    expect(lines[1]).toMatch(/^ › cpu\s+scan_02/)                    // up to the top, to make room
+    const shown = under("scan_02")
+    expect(shown.slice(0, 3)).toEqual(["Output, last 40 lines", "line 1", "line 2"])
+    const more = /^… (\d+) more lines$/.exec(shown[shown.length - 1]!)
+    expect(more).not.toBeNull()
+    expect(shown.length - 1 + Number(more![1])).toBe(41)             // each line shown or counted
+    expect(lines[1 + shown.length + 1]).toMatch(/^─+/)               // and the screen full: the prompt's rule
+  })
+
+  test("with a service before version 5, space asks nothing and says to restart it", async () => {
+    const { calls } = await mount({ version: 4, jobs: () => JOBS5 })
+    await line("/jobs")
+    await settled()
+    await space()
+    expect(screen()).toContain("restart the agent service to see details")
+    expect(screen()).not.toContain("loading…")
+    await w!.escape()
+    await line("/clusters")
+    await settled()
+    await space()
+    expect(screen()).not.toContain("loading…")
+    expect(called(calls, "job.detail")).toEqual([])
+    expect(called(calls, "cluster.detail")).toEqual([])
   })
 })
 

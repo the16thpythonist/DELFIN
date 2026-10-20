@@ -93,6 +93,9 @@ export interface AppProps {
   /** How long a new item names itself at the bottom right, and for how
    *  long after the window opens nothing is news (tests shorten them). */
   arrival?: { shownMs: number; quietMs: number }
+  /** How often an open /clusters or /jobs asks again (clusters/view.tsx
+   *  CLUSTERS_POLL_MS); tests shorten it. */
+  clustersPollMs?: number
   /** Full screen: the session's rows in the window (session.ts), scrolled
    *  by the wheel and the keys; a selection is copied when the drag ends. */
   screen?: ScreenItems
@@ -486,6 +489,8 @@ export function App(props: AppProps): JSX.Element {
     keymap: props.keymap,
     say,
     login: (row) => login.open(row),
+    serviceVersion: () => store.state.serviceVersion,
+    pollMs: props.clustersPollMs,
   })
   const login = createLogin({
     request: (method, params) => props.client.request(method, params),

@@ -136,7 +136,8 @@ export interface AppState {
    *  until the service of this connection has said one. */
   attentionVersion: number
   /** What the service does beyond its protocol (its hello's
-   *  serviceVersion): 4 and later answer /clusters and /jobs. */
+   *  serviceVersion): 4 and later answer /clusters and /jobs, 5 and later
+   *  their entries' details (space). */
   serviceVersion: number
 }
 
