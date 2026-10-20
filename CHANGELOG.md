@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — cluster-tunnel is a dependency, the base for sending calculations to a cluster
+
+- **DELFIN installs cluster-tunnel (ctun) 0.7.** ctun keeps one logged-in
+  ssh connection per HPC cluster on the user's PC: a person logs in once
+  with password and OTP, and everything after that reuses the connection.
+  DELFIN's remote layer, which comes next, runs, transfers and submits over
+  it through ctun's Python API, so DELFIN no longer has to be started on a
+  login node. A plain `pip install delfin-complat` now also brings the
+  `ctun` command and two small MIT packages (rich-click, appdirs); nothing
+  DELFIN pins moves.
+- **The parts of ctun's API that DELFIN relies on are pinned by tests**,
+  against a fake ssh: without a login a command is refused with ctun's exit
+  code 10, a command comes back with its output and exit code, each word
+  reaches the remote shell as one argument, and a cluster with a pinned
+  host key runs every ssh against that key alone. A ctun release that
+  changes any of this fails DELFIN's CI, not a run on a cluster.
+
 ### Security — what runs unasked writes nothing, loads no script and reaches nothing
 
 - **sed asks when it edits in place or reads its script from a file**, in
