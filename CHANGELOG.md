@@ -27,10 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   job monitor, and the active jobs on each logged-in cluster -- also the
   ones submitted by hand. A source that cannot be read is named, never
   shown as empty. `/jobs` with an argument is still the session's.
+- **Space opens an entry's details under its row**, asked again every few
+  seconds while open. A cluster: logged in since when, the budget used and
+  left, its jobs, the guard, DELFIN's installs there with what each lacks
+  (std2 without gfortran) and which is the PC's commit, and whether the
+  server still presents the pinned host key -- for a refused one the key
+  it presents, to compare before pinning it. A job: Slurm's facts (state
+  and pending reason, partition, nodes, CPUs and GPUs, times), where it
+  runs (work dir, output files, the DELFIN install it uses) and its
+  output's last 20 lines; an agent's background item: its output. Only
+  the window asks: the details read files on a cluster and other
+  sessions' output. In `/jobs`, ↑/↓ moves from job to job.
 - Everything these screens show from elsewhere (a job name from a
-  cluster, a watch file in a workspace) is cut to one printable line: no
-  escape sequence reaches the terminal. cluster-tunnel is required from
-  0.8.0 (its login with the caller's credentials).
+  cluster, a watch file in a workspace, a job's output) is stripped of
+  control characters and escape sequences: none reaches the terminal.
+  cluster-tunnel is required from 0.8.0 (its login with the caller's
+  credentials).
 
 ### Added — DELFIN installs itself on a cluster, per commit and only published ones
 
