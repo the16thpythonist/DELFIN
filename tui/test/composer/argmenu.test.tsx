@@ -59,9 +59,17 @@ describe("the menu after a command", () => {
   test("/ lists every command with its summary", async () => {
     await mount()
     await type("/")
-    for (const c of COMMANDS) expect(screen()).toContain(c.name)
-    expect(screen()).toContain("Summarise history to free space")
-    expect(screen()).toContain("/resume")                       // the window's own
+    // More than the list's rows: what it shows as ↓ walks it.
+    let seen = screen()
+    for (let i = 0; i < COMMANDS.length + 4; i++) {
+      w!.keys.pressArrow("down")
+      await w!.settle()
+      seen += screen()
+    }
+    for (const c of COMMANDS) expect(seen).toContain(c.name)
+    expect(seen).toContain("Summarise history to free space")
+    expect(seen).toContain("/resume")                           // the window's own
+    expect(seen).toContain("/clusters")
   })
 
   test("/model : the served models, the current one marked; enter on another switches", async () => {
