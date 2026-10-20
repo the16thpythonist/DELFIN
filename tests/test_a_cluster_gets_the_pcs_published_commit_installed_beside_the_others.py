@@ -236,8 +236,8 @@ def test_a_tool_that_fails_is_a_warning_of_a_complete_install(world):
     world.publish()
     outcome = _ensure(world, commit)
     assert outcome.state == "complete"
-    assert outcome.warnings == ["FAILED qm: xtb std2 (missing: std2)",
-                                "FAILED   install of tools (see the lines above)"]
+    # The installer's own summary line ("see the lines above") is left out.
+    assert outcome.warnings == ["FAILED qm: xtb std2 (missing: std2)"]
     assert _ensure(world, commit).warnings == outcome.warnings
 
 

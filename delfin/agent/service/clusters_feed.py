@@ -44,15 +44,27 @@ from typing import Any, Callable, Iterable, Optional
 ROW_PROBE_S = 60.0
 JOBS_PROBE_S = 30.0
 
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f  ‪-‮⁦-⁩]")
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f  ‪-‮⁦-⁩]")
+# Terminal escape sequences, taken out whole (a coloured log line reads as
+# its words): CSI (ESC [ ... final byte), OSC (ESC ] ... BEL or ESC \),
+# and any other ESC pair.
+_ESCAPE = re.compile("\x1b\\[[0-?]*[ -/]*[@-~]|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)?|\x1b[@-_]?")
 _lock = threading.Lock()
 _cache: dict[tuple[str, str], tuple[float, Any]] = {}
 
 
 def clean(value: Any, limit: int = 160) -> str:
     """``value`` as one line of printable text, at most ``limit`` characters."""
-    text = _CONTROL.sub(" ", str(value if value is not None else ""))
+    text = _CONTROL.sub(" ", _ESCAPE.sub("", str(value if value is not None else "")))
     text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def clean_line(value: Any, limit: int = 300) -> str:
+    """``clean`` for a line shown as it is (an output tail, an indented
+    list): the same characters taken out, the spacing kept."""
+    text = _ESCAPE.sub("", str(value if value is not None else "")).expandtabs(4)
+    text = _CONTROL.sub(" ", text).rstrip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
@@ -189,12 +201,15 @@ def jobs(sessions: Iterable[dict], *, settings: Optional[dict] = None) -> dict:
             if not workspace:
                 continue
             view = background_view.collect(workspace, session_id=str(s.get("sessionId") or ""))
+            listed = background_view.rows(view)
+            errors += [clean(f"{s.get('title') or workspace}: {r['label']} ({r['detail']})", 200)
+                       for r in listed if r.get("group") == "errors"]
             rows = [{"id": clean(r["id"], 64), "kind": clean(r["kind"], 40),
                      "label": clean(r["label"], 120), "state": "",
-                     "detail": clean(r["detail"], 160)}
-                    for r in background_view.rows(view)]
+                     "detail": clean(r["detail"], 160), "group": clean(r.get("group"), 16)}
+                    for r in listed if r.get("group") != "errors"]
             if rows:
-                groups.append({"source": "agent",
+                groups.append({"source": "agent", "session": clean(s.get("sessionId"), 64),
                                "title": clean(s.get("title") or workspace, 80),
                                "rows": rows})
     except Exception as exc:  # noqa: BLE001
@@ -246,3 +261,298 @@ def _cluster_groups(settings: Optional[dict], errors: list[str]) -> list[dict]:
                     "title": clean(f"{name} ({cluster.target})", 120), "rows": rows,
                     "finished": finished})
     return out
+
+
+# --- details: what Space on an entry shows -------------------------------------------
+#
+# One answer shape for every kind of entry: sections, each a title, label
+# and value pairs and lines (an output tail). A window draws them alike.
+# Asked when an entry is opened and again while it stays open, so each is
+# reused for a while: a job's for a few seconds, a cluster's for half a
+# minute, its host key (a fresh connection to the server) for five.
+
+DETAIL_S = 5.0
+CLUSTER_DETAIL_S = 30.0
+HOST_KEY_S = 300.0
+TAIL_LINES = 20
+_TAIL_BYTES = 16384
+_JOB_ID = re.compile(r"[0-9]+(?:_[0-9]+)?")
+
+
+def _section(title: str, pairs: Iterable[tuple[str, Any]] = (),
+             lines: Iterable[Any] = ()) -> dict:
+    return {"title": clean(title, 60),
+            "pairs": [[clean(k, 40), clean(v, 300)] for k, v in pairs if v not in (None, "")],
+            "lines": [clean_line(line) for line in lines]}
+
+
+def _when(epoch: Any) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(epoch)))
+    except (TypeError, ValueError, OverflowError):
+        return ""
+
+
+def cluster_detail(name: str, *, settings: Optional[dict] = None) -> dict:
+    """``{"sections": [...], "error"}``: the session and its budget, DELFIN's
+    installs there with what they lack, and the host key."""
+    from cluster_tunnel import api as ctun_api
+    from delfin.remote import clusters as registry
+    from delfin.remote import connection
+    from delfin.remote.errors import RemoteError
+
+    cluster = registry.load(settings=settings).get(name)
+    if cluster is None:
+        return {"sections": [], "error": clean(f"{name} is not one of DELFIN's clusters", 120)}
+    if not cluster.usable:
+        sections = [_section("Refused", lines=cluster.problems)]
+        if cluster.target:
+            # ctun knows it: the key its server presents, to compare with the
+            # fingerprint its operators publish before `ctun hostkey --pin`.
+            where = {"config_path": cluster.ctun_config}
+            sections.append(_cached(("hostkey", name), HOST_KEY_S,
+                                    lambda: _host_key_section(name, ctun_api, where)))
+        return {"sections": sections, "error": None}
+    try:
+        conn = connection.connect(name, settings=settings)
+        live = conn.is_live()
+    except RemoteError as exc:
+        return {"sections": [], "error": clean(f"{exc.code}: {exc}", 300)}
+    where = {"config_path": cluster.ctun_config}
+    sections = [_cached(("session", name), CLUSTER_DETAIL_S,
+                        lambda: _session_section(conn, cluster, live, ctun_api, where))]
+    if live:
+        sections.append(_cached(("installs", name), CLUSTER_DETAIL_S,
+                                lambda: _installs_section(conn)))
+    sections.append(_cached(("hostkey", name), HOST_KEY_S,
+                            lambda: _host_key_section(name, ctun_api, where)))
+    return {"sections": sections, "error": None}
+
+
+def _session_section(conn, cluster, live: bool, ctun_api, where: dict) -> dict:
+    pairs: list[tuple[str, Any]] = [("Target", cluster.target)]
+    try:
+        entry = ctun_api.load_config(cluster.ctun_config).clusters[cluster.name]
+        budget = entry.budget
+    except Exception:  # noqa: BLE001
+        budget = None
+    if not live:
+        pairs.append(("Login", "nobody is logged in"))
+    else:
+        try:
+            (status,) = ctun_api.status(cluster.name, **where)
+            since = _when((status.session or {}).get("start_epoch"))
+        except Exception:  # noqa: BLE001
+            since = ""
+        pairs.append(("Login", f"logged in since {since}" if since else "logged in"))
+        try:
+            decision = conn.budget()
+            if decision.limit is None:
+                pairs.append(("Budget", "no session limit set"))
+            else:
+                left = max(0.0, float(decision.limit) - float(decision.used or 0))
+                pairs.append(("Budget", f"{decision.used} of {decision.limit} {decision.unit} used,"
+                                        f" {left:g} left"))
+        except Exception as exc:  # noqa: BLE001
+            pairs.append(("Budget", f"not read: {exc}"))
+        try:
+            listing = _cached(("jobs", cluster.name), JOBS_PROBE_S, conn.jobs)
+            active = sum(1 for j in listing if getattr(j, "source", "") == "active")
+            pairs.append(("Jobs", f"{active} active, {len(listing) - active} finished recently"))
+        except Exception as exc:  # noqa: BLE001
+            pairs.append(("Jobs", f"not read: {exc}"))
+    if budget is not None:
+        pairs.append(("Guard", f"{budget.guard_scope}: {', '.join(budget.guard_commands)}"))
+    pairs += [("Work dir", cluster.work_dir), ("Install root", cluster.install_root),
+              ("Partition", cluster.default_partition or "the cluster's default")]
+    return _section("Session", pairs)
+
+
+def _installs_section(conn) -> dict:
+    from delfin.remote import install
+    try:
+        here = install.installs(conn)
+    except Exception as exc:  # noqa: BLE001
+        return _section("DELFIN on it", lines=[f"the installs could not be listed: {exc}"])
+    try:
+        mine = install.pc_commit().sha
+    except Exception:  # noqa: BLE001
+        mine = ""
+    lines = []
+    for sha, state in here.items():
+        mark = "  ← this PC's commit" if mine and sha == mine else ""
+        lines.append(f"{sha[:12]}  {state}{mark}")
+        if state == "complete":
+            try:
+                lines += [f"    lacks: {w}" for w in install.warnings(conn, sha)]
+            except Exception:  # noqa: BLE001
+                pass
+    if not here:
+        lines.append("no install of DELFIN's yet")
+    if mine and mine not in here:
+        lines.append(f"this PC runs {mine[:12]}: installed with the first submit, once it is published")
+    return _section("DELFIN on it", lines=lines)
+
+
+def _host_key_section(name: str, ctun_api, where: dict) -> dict:
+    try:
+        status = ctun_api.host_key(name, **where)
+    except Exception as exc:  # noqa: BLE001
+        return _section("Host key", lines=[f"the server could not be asked: {exc}"])
+    pinned = ", ".join(k.fingerprint for k in status.pinned) or "none"
+    verdict = ("the server presents the pinned key" if status.matches
+               else "the server presents a DIFFERENT key than the pinned one"
+               if status.pinned else "not pinned")
+    return _section("Host key", [("Presented", f"{status.offered.kind} {status.offered.fingerprint}"),
+                                 ("Pinned", pinned), ("Verdict", verdict)])
+
+
+def job_detail(params: dict, sessions: Iterable[dict], *,
+               settings: Optional[dict] = None) -> dict:
+    """``{"sections": [...], "error"}`` for one row of jobs.list.
+
+    ``source`` cluster: ``cluster`` and ``id``, which must be one of the
+    user's active jobs there -- Slurm's facts, where it runs, and its
+    output's tail. ``source`` agent: ``session`` (an id this service runs:
+    its workspace is looked up here, never taken from the window), ``group``
+    and ``id`` -- the background item's output tail. ``source`` monitor:
+    the watch entry."""
+    source = str(params.get("source") or "")
+    job_id = str(params.get("id") or "")
+    if source == "cluster":
+        name = str(params.get("cluster") or "")
+        return _cached(("job", f"{name}:{job_id}"), DETAIL_S,
+                       lambda: _cluster_job_detail(name, job_id, settings))
+    if source == "agent":
+        return _agent_detail(str(params.get("session") or ""), str(params.get("group") or ""),
+                             job_id, sessions)
+    if source == "monitor":
+        return _monitor_detail(job_id)
+    return {"sections": [], "error": clean(f"no such source: {source}", 80)}
+
+
+def _cluster_job_detail(name: str, job_id: str, settings: Optional[dict]) -> dict:
+    from delfin.remote import connection
+    from delfin.remote.errors import RemoteError
+
+    if not _JOB_ID.fullmatch(job_id):
+        return {"sections": [], "error": "not a Slurm job id"}
+    try:
+        conn = connection.connect(name, settings=settings)
+        listing = _cached(("jobs", name), JOBS_PROBE_S, conn.jobs)
+        if not any(str(getattr(j, "jobid", "")) == job_id for j in listing):
+            return {"sections": [], "error": clean(f"{job_id} is none of your jobs on {name}", 120)}
+        shown = conn.run(["scontrol", "show", "job", "-o", job_id], timeout=30)
+        fields = parse_scontrol(shown.stdout or "") if shown.ok else {}
+        if not fields:
+            fields = _sacct_fields(conn, job_id)
+        tail = []
+        out = fields.get("StdOut", "")
+        if fields.get("JobState", "").startswith("PENDING"):
+            tail = ["no output yet: the job has not started"]
+        elif out.startswith("/"):
+            got = conn.run(["tail", "-c", str(_TAIL_BYTES), "--", out], timeout=30)
+            if got.ok:
+                tail = (got.stdout or "").splitlines()[-TAIL_LINES:]
+            elif "No such file" in (got.stderr or ""):
+                tail = ["no output file yet"]
+            else:
+                tail = [f"not readable: {got.stderr or ''}"]
+    except RemoteError as exc:
+        return {"sections": [], "error": clean(f"{exc.code}: {exc}", 300)}
+    return {"sections": _job_sections(job_id, fields, tail), "error": None}
+
+
+def parse_scontrol(text: str) -> dict[str, str]:
+    """``scontrol show job -o``'s one line as key -> value (a value may hold
+    spaces: it runs to the next ``Key=``)."""
+    line = text.strip().splitlines()[0] if text.strip() else ""
+    parts = re.split(r" (?=[A-Za-z][A-Za-z/:]*=)", line)
+    out = {}
+    for part in parts:
+        key, sep, value = part.partition("=")
+        if sep:
+            out[key] = value
+    return out
+
+
+def _sacct_fields(conn, job_id: str) -> dict[str, str]:
+    names = ["JobName", "State", "Reason", "Partition", "NNodes", "NCPUS", "AllocTRES",
+             "Submit", "Start", "Elapsed", "Timelimit", "WorkDir", "Comment"]
+    got = conn.run(["sacct", "-j", job_id, "-X", "-n", "-P", "-o", ",".join(names)], timeout=30)
+    row = (got.stdout or "").strip().splitlines()[:1] if got.ok else []
+    if not row:
+        return {}
+    values = dict(zip(names, row[0].split("|")))
+    return {"JobName": values.get("JobName", ""), "JobState": values.get("State", ""),
+            "Reason": values.get("Reason", ""), "Partition": values.get("Partition", ""),
+            "NumNodes": values.get("NNodes", ""), "NumCPUs": values.get("NCPUS", ""),
+            "AllocTRES": values.get("AllocTRES", ""), "SubmitTime": values.get("Submit", ""),
+            "StartTime": values.get("Start", ""), "RunTime": values.get("Elapsed", ""),
+            "TimeLimit": values.get("Timelimit", ""), "WorkDir": values.get("WorkDir", ""),
+            "Comment": values.get("Comment", "")}
+
+
+def _job_sections(job_id: str, f: dict[str, str], tail: list[str]) -> list[dict]:
+    state = f.get("JobState", "")
+    reason = f.get("Reason", "")
+    if reason and reason not in ("None", "(null)"):
+        state = f"{state} ({reason})"
+    tres = f.get("AllocTRES") or f.get("ReqTRES") or f.get("TRES") or ""
+    gpus = re.search(r"gres/gpu(?::[^=,]+)?=(\d+)", tres)
+    nodes = f.get("NumNodes", "")
+    low, _, high = nodes.partition("-")
+    nodes = low if high == low else nodes          # Slurm's "1-1" for a pending job
+    resources = ", ".join(x for x in (
+        f"{nodes} node(s)" if nodes else "",
+        f"{f['NumCPUs']} CPUs" if f.get("NumCPUs") else "",
+        f"{gpus.group(1)} GPU(s)" if gpus else "") if x)
+    start = f.get("StartTime", "")
+    time_used = " of ".join(x for x in (f.get("RunTime", ""), f.get("TimeLimit", "")) if x)
+    commit = re.search(r"delfin-commit=([0-9a-f]{7,40})", f.get("Comment", ""))
+    err = f.get("StdErr", "")
+    sections = [
+        _section("Slurm", [("Job", f"{job_id} {f.get('JobName', '')}".strip()), ("State", state),
+                           ("Partition", f.get("Partition", "")), ("Resources", resources),
+                           ("Submitted", f.get("SubmitTime", "")),
+                           ("Started", "" if start in ("", "Unknown", "None") else start),
+                           ("Time", time_used)]),
+        _section("Where it runs", [("Work dir", f.get("WorkDir", "")),
+                                   ("Output", f.get("StdOut", "")),
+                                   ("Errors", err if err and err != f.get("StdOut") else ""),
+                                   ("DELFIN", f"install {commit.group(1)[:12]}" if commit else "")]),
+    ]
+    if tail or f.get("StdOut"):
+        sections.append(_section(f"Output, last {TAIL_LINES} lines", lines=tail or ["(empty)"]))
+    return sections
+
+
+def _agent_detail(session_id: str, group: str, item_id: str, sessions: Iterable[dict]) -> dict:
+    workspace = next((str(s.get("workspace") or "") for s in sessions
+                      if str(s.get("sessionId") or "") == session_id), "")
+    if not workspace:
+        return {"sections": [], "error": "that session does not run in this service"}
+    if group not in ("shells", "watches", "agents", "wakeups"):
+        return {"sections": [], "error": "no such group"}
+    try:
+        from delfin.agent import background_view
+        text = background_view.peek(workspace, group, item_id, lines=TAIL_LINES)
+    except Exception as exc:  # noqa: BLE001
+        return {"sections": [], "error": clean(f"not read: {exc}", 200)}
+    lines = str(text or "").splitlines()[-TAIL_LINES:]
+    return {"sections": [_section(f"Output, last {TAIL_LINES} lines", lines=lines or ["(empty)"])],
+            "error": None}
+
+
+def _monitor_detail(job_id: str) -> dict:
+    try:
+        from delfin.agent import job_monitor
+        rec = (job_monitor.load_watched().get("jobs") or {}).get(job_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"sections": [], "error": clean(f"not read: {exc}", 200)}
+    if not isinstance(rec, dict):
+        return {"sections": [], "error": "no longer watched"}
+    return {"sections": [_section("Watched", [("Job", job_id), ("Folder", rec.get("folder")),
+                                              ("Last state", rec.get("last_state")),
+                                              ("Since", _when(rec.get("added_at")))])],
+            "error": None}

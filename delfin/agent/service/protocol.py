@@ -261,6 +261,15 @@ SERVICE_REQUESTS: dict[str, dict[str, str]] = {
     # and wake-ups per session, DELFIN's job monitor, and the active jobs on
     # each logged-in cluster.
     "jobs.list": {},
+    # What Space on an entry shows (clusters_feed.cluster_detail and
+    # job_detail): the session, budget, DELFIN's installs and host key of a
+    # cluster; Slurm's facts, where a job runs and its output's tail. Only a
+    # window asks: they read files on a cluster and other sessions' output.
+    # job.detail: source cluster (cluster, id: one of the user's active
+    # jobs), agent (session: an id this service runs, group, id) or monitor.
+    "cluster.detail": {"name": "string"},
+    "job.detail": {"source": "string", "id": "string", "cluster": "string?",
+                   "session": "string?", "group": "string?"},
 }
 
 SERVICE_RESULTS: dict[str, dict[str, str]] = {
@@ -298,6 +307,9 @@ SERVICE_RESULTS: dict[str, dict[str, str]] = {
     "cluster.logout": {"ok": "boolean", "closed": "boolean", "code": "string?",
                        "error": "string?"},
     "jobs.list": {"groups": "[object]", "errors": "[string]"},
+    # sections: each {title, pairs: [[label, value]], lines: [text]}.
+    "cluster.detail": {"sections": "[object]", "error": "string?"},
+    "job.detail": {"sections": "[object]", "error": "string?"},
 }
 
 #: Events from the service itself, to every window.

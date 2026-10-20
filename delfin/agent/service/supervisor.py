@@ -58,7 +58,8 @@ from . import attention_feed, clusters_feed, eventlog, protocol, rundir
 #: 3: attention.list/answer/dismiss and attention.updated (what needs the
 #: user, from every DELFIN process), and session.create's brief.
 #: 4: clusters.list, cluster.login/logout and jobs.list (delfin.remote).
-SERVICE_VERSION = 4
+#: 5: cluster.detail and job.detail (what Space on an entry shows).
+SERVICE_VERSION = 5
 
 #: Requests a window sends to the service itself (the one definition is
 #: protocol.SERVICE_REQUESTS, which the TUI's types are generated from).
@@ -76,7 +77,8 @@ ACTING = frozenset({"session.create", "session.prompt", "session.cancel",
                     "session.setMode", "session.shutdown", "permission.reply",
                     "session.message", "service.shutdown", "session.toggleTasks",
                     "session.setTitle", "attention.answer", "attention.dismiss",
-                    "cluster.login", "cluster.logout"})
+                    "cluster.login", "cluster.logout", "cluster.detail",
+                    "job.detail"})
 
 UNKNOWN_SESSION = protocol.UNKNOWN_SESSION
 WORKER_GONE = protocol.WORKER_GONE
@@ -1191,6 +1193,14 @@ class Supervisor:
 
     async def _m_jobs_list(self, _client: Client, _params: dict) -> dict:
         return await asyncio.to_thread(clusters_feed.jobs, self._summaries())
+
+    async def _m_cluster_detail(self, _client: Client, params: dict) -> dict:
+        return await asyncio.to_thread(clusters_feed.cluster_detail, str(params["name"]))
+
+    async def _m_job_detail(self, _client: Client, params: dict) -> dict:
+        # An agent item's workspace comes from this service's own sessions,
+        # never from the window's params.
+        return await asyncio.to_thread(clusters_feed.job_detail, params, self._summaries())
 
     async def _watch_attention(self) -> None:
         """While a window is there to tell: the attention records looked at

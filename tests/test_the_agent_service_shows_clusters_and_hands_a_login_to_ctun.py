@@ -168,16 +168,19 @@ def test_an_unusable_cluster_is_not_logged_in(service):
     assert not (service.state / "calls").exists() or "-M" not in (service.state / "calls").read_text()
 
 
-def test_an_agents_own_process_may_look_but_not_log_in(service):
+def test_an_agents_own_process_may_look_but_not_log_in_or_read_details(service):
     probe = r"""
 import json, sys
 sys.path.insert(0, sys.argv[2])
 from delfin.agent.service.client import ServiceClient, ServiceError
 c = ServiceClient(sys.argv[1])
 out = {"listed": len(c.request("clusters.list", timeout=60)["clusters"])}
-for method in ("cluster.login", "cluster.logout"):
+for method, params in (("cluster.login", {"name": "kcist", "password": sys.argv[3]}),
+                       ("cluster.logout", {"name": "kcist"}),
+                       ("cluster.detail", {"name": "kcist"}),
+                       ("job.detail", {"source": "cluster", "cluster": "kcist", "id": "1"})):
     try:
-        c.request(method, {"name": "kcist", "password": sys.argv[3]}, timeout=60)
+        c.request(method, params, timeout=60)
         out[method] = "done"
     except ServiceError as exc:
         out[method] = exc.code
@@ -191,7 +194,8 @@ print(json.dumps(out))
                          env=env, capture_output=True, text=True, timeout=120)
     got = json.loads(run.stdout.strip().splitlines()[-1])
     assert got == {"listed": 2, "cluster.login": protocol.NOT_ALLOWED,
-                   "cluster.logout": protocol.NOT_ALLOWED}
+                   "cluster.logout": protocol.NOT_ALLOWED, "cluster.detail": protocol.NOT_ALLOWED,
+                   "job.detail": protocol.NOT_ALLOWED}
     calls = (service.state / "calls").read_text() if (service.state / "calls").exists() else ""
     assert "-M" not in calls, "the refused login started ssh"
 

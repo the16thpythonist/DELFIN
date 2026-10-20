@@ -459,6 +459,16 @@ export interface ClusterLogoutParams {
   "name": string
 }
 export interface JobsListParams {}
+export interface ClusterDetailParams {
+  "name": string
+}
+export interface JobDetailParams {
+  "source": string
+  "id": string
+  "cluster"?: string | null
+  "session"?: string | null
+  "group"?: string | null
+}
 export interface ServiceRequests {
   "hello": HelloParams
   "sessions.list": SessionsListParams
@@ -476,6 +486,8 @@ export interface ServiceRequests {
   "cluster.login": ClusterLoginParams
   "cluster.logout": ClusterLogoutParams
   "jobs.list": JobsListParams
+  "cluster.detail": ClusterDetailParams
+  "job.detail": JobDetailParams
 }
 export interface HelloResult {
   "protocolVersion": number
@@ -557,6 +569,14 @@ export interface JobsListResult {
   "groups": Record<string, unknown>[]
   "errors": string[]
 }
+export interface ClusterDetailResult {
+  "sections": Record<string, unknown>[]
+  "error"?: string | null
+}
+export interface JobDetailResult {
+  "sections": Record<string, unknown>[]
+  "error"?: string | null
+}
 export interface ServiceResults {
   "hello": HelloResult
   "sessions.list": SessionsListResult
@@ -574,6 +594,8 @@ export interface ServiceResults {
   "cluster.login": ClusterLoginResult
   "cluster.logout": ClusterLogoutResult
   "jobs.list": JobsListResult
+  "cluster.detail": ClusterDetailResult
+  "job.detail": JobDetailResult
 }
 export interface SessionSummaryEvent {
   "summary": Record<string, unknown>

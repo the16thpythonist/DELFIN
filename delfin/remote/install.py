@@ -205,6 +205,12 @@ def installs(conn) -> dict[str, str]:
     return out
 
 
+def warnings(conn, sha: str) -> list[str]:
+    """What complete install ``sha`` lacks (tools that failed, ORCA not
+    found), one line each; empty for an install that is not complete."""
+    return _warnings(conn, _install_dir(conn, sha))
+
+
 def in_use(conn) -> set[str]:
     """Commits that a queued or running job of the user's names."""
     return {line.strip() for line in _script(conn, "inuse").splitlines() if line.strip()}
@@ -316,4 +322,5 @@ def _audit(action: str, cluster: str, sha: str, source: str, path: str) -> None:
 
 
 __all__ = ["Commit", "Outcome", "SCRIPT", "ensure_installed", "in_use", "installs",
-           "job_comment", "pc_commit", "published_source", "remove_unused", "state"]
+           "job_comment", "pc_commit", "published_source", "remove_unused", "state",
+           "warnings"]

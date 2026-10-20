@@ -64,7 +64,7 @@ case "$action" in
         --profile standard --yes
       rc=$?
       grep -E "^\[delfin-install\] (FAILED|ORCA +not found)" "$1/.delfin-install.log" \
-        > "$1/.delfin-install.warnings" 2>/dev/null
+        | grep -v "(see the lines above)" > "$1/.delfin-install.warnings" 2>/dev/null
       if [ "$rc" -eq 0 ] || { (cd / && "$1/.venv/bin/python" -c "import delfin") >/dev/null 2>&1 \
            && ! grep -qE "^\[delfin-install\] FAILED +openmpi" "$1/.delfin-install.log"; }; then
         date -u +%Y-%m-%dT%H:%M:%SZ > "$1/.delfin-install-complete"

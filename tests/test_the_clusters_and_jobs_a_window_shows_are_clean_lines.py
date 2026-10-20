@@ -46,6 +46,8 @@ class Cluster:
     requires_otp: bool = False
     work_dir: str = "~/delfin/jobs"
     default_partition: str | None = "small"
+    install_root: str = "~/delfin/installs"
+    ctun_config: object = None
 
 
 @dataclass
@@ -108,7 +110,7 @@ def test_no_control_character_reaches_the_window(world):
     for bad in ("\x1b", "\n", "\x07", "‮"):
         assert bad not in text, repr(bad)
     label = got["groups"][-1]["rows"][0]["label"]
-    assert label == "[2Jgq_prior rm -rf ~"
+    assert label == "gq_prior rm -rf ~"
 
 
 def test_a_source_that_cannot_be_read_is_named(world, monkeypatch):
@@ -152,3 +154,147 @@ def test_a_login_error_never_carries_the_secrets(monkeypatch):
     assert (got["ok"], got["code"]) == (False, "login_failed")
     assert "hunter2-pw" not in got["error"] and "424242" not in got["error"]
     assert got["error"] == "ssh said: *** / *** rejected"
+
+
+# ---------------------------------------------------------------------------
+# What Space on an entry shows: job.detail and cluster.detail
+# ---------------------------------------------------------------------------
+
+SCONTROL = ("JobId=51901 JobName=gq prior v3 UserId=me(1) JobState=PENDING Reason=Resources "
+            "RunTime=00:00:00 TimeLimit=3-00:00:00 SubmitTime=2026-10-19T11:11:23 "
+            "StartTime=Unknown Partition=small NumNodes=1 NumCPUs=32 "
+            "AllocTRES=cpu=32,mem=64G,node=1,gres/gpu=2 WorkDir=/home/me/run "
+            "StdErr=/home/me/run/err.log StdOut=/home/me/run/out.log "
+            "Comment=delfin-commit=d0f280af32686e4e635e9aa909e3e71bd922ec37\n")
+
+
+class Result:
+    def __init__(self, stdout="", ok=True, stderr=""):
+        self.stdout, self.ok, self.stderr = stdout, ok, stderr
+
+
+def _with_runs(conn, answers):
+    ran = []
+
+    def run(argv, timeout=None):
+        ran.append(argv)
+        return answers.get(argv[0], Result(ok=False))
+    conn.run = run
+    return ran
+
+
+def test_a_cluster_job_shows_slurms_facts_where_it_runs_and_its_output(world):
+    running = SCONTROL.replace("JobState=PENDING Reason=Resources", "JobState=RUNNING Reason=None")
+    ran = _with_runs(world["kcist"], {
+        "scontrol": Result(running),
+        "tail": Result("".join(f"step {n}\n" for n in range(40)) + "\x1b[31mred\x1b[0m done\n")})
+    got = feed.job_detail({"source": "cluster", "cluster": "kcist", "id": "51901"}, [])
+    assert got["error"] is None
+    slurm, where, output = got["sections"]
+    assert dict(slurm["pairs"]) == {"Job": "51901 gq prior v3", "State": "RUNNING",
+                                    "Partition": "small",
+                                    "Resources": "1 node(s), 32 CPUs, 2 GPU(s)",
+                                    "Submitted": "2026-10-19T11:11:23",
+                                    "Time": "00:00:00 of 3-00:00:00"}
+    assert dict(where["pairs"]) == {"Work dir": "/home/me/run", "Output": "/home/me/run/out.log",
+                                    "Errors": "/home/me/run/err.log",
+                                    "DELFIN": "install d0f280af3268"}
+    assert len(output["lines"]) == feed.TAIL_LINES and output["lines"][-1] == "red done"
+    assert ["tail", "-c", "16384", "--", "/home/me/run/out.log"] in ran
+
+
+def test_only_the_users_own_active_jobs_are_looked_into(world):
+    ran = _with_runs(world["kcist"], {"scontrol": Result(SCONTROL)})
+    for job_id in ("99999", "51901; cat ~/.ssh/id_rsa", "../x", ""):
+        got = feed.job_detail({"source": "cluster", "cluster": "kcist", "id": job_id}, [])
+        assert got["sections"] == [] and got["error"], job_id
+    assert ran == []
+
+
+def test_an_agent_items_output_is_found_through_the_services_own_sessions(world, monkeypatch):
+    from delfin.agent import background_view
+    peeked = []
+    monkeypatch.setattr(background_view, "peek", lambda ws, group, item, lines=20:
+                        peeked.append((ws, group, item)) or "line 1\nline 2\n")
+    sessions = [{"sessionId": "s1", "workspace": "/ws/a"}]
+    got = feed.job_detail({"source": "agent", "session": "s1", "group": "shells", "id": "b1",
+                           "workspace": "/etc"}, sessions)
+    assert got["sections"][0]["lines"] == ["line 1", "line 2"]
+    assert peeked == [("/ws/a", "shells", "b1")], "the workspace is the service's, not the window's"
+    stranger = feed.job_detail({"source": "agent", "session": "nope", "group": "shells", "id": "b1"},
+                               sessions)
+    assert stranger["sections"] == [] and len(peeked) == 1
+
+
+def test_a_cluster_shows_its_session_installs_and_host_key(world, monkeypatch):
+    from cluster_tunnel import api as ctun_api
+    from delfin.remote import install
+
+    @dataclass
+    class Key:
+        kind: str = "ED25519"
+        fingerprint: str = "SHA256:vmKr"
+
+    @dataclass
+    class HostKeyStatus:
+        offered: Key = field(default_factory=Key)
+        pinned: list = field(default_factory=lambda: [Key()])
+        matches: bool = True
+
+    @dataclass
+    class Status:
+        session: dict = field(default_factory=lambda: {"start_epoch": 1792488228})
+
+    monkeypatch.setattr(ctun_api, "status", lambda name, **kw: [Status()])
+    monkeypatch.setattr(ctun_api, "host_key", lambda name, **kw: HostKeyStatus())
+    monkeypatch.setattr(ctun_api, "load_config", lambda path=None: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(install, "installs", lambda conn: {"d0f280af" * 5: "complete",
+                                                            "affb5a53" * 5: "running"})
+    monkeypatch.setattr(install, "warnings", lambda conn, sha: ["FAILED qm: std2 (missing: std2)"])
+    monkeypatch.setattr(install, "pc_commit",
+                        lambda: install.Commit(sha="d0f280af" * 5, checkout=None, dirty=False))
+    from delfin.remote import clusters as registry
+    monkeypatch.setattr(registry, "load", lambda settings=None: {"kcist": Cluster("kcist")})
+    got = feed.cluster_detail("kcist")
+    session, installs, key = got["sections"]
+    pairs = dict(session["pairs"])
+    assert pairs["Login"].startswith("logged in since 2026-")
+    assert pairs["Budget"] == "2.5 of 100.0 jobh used, 97.5 left"
+    assert pairs["Jobs"] == "1 active, 1 finished recently"
+    assert installs["lines"] == ["d0f280afd0f2  complete  ← this PC's commit",
+                                 "    lacks: FAILED qm: std2 (missing: std2)",
+                                 "affb5a53affb  running"]
+    assert dict(key["pairs"])["Verdict"] == "the server presents the pinned key"
+
+
+def test_a_refused_cluster_shows_why_and_the_key_to_pin(world, monkeypatch):
+    from cluster_tunnel import api as ctun_api
+    asked = []
+
+    @dataclass
+    class Key:
+        kind: str = "ED25519"
+        fingerprint: str = "SHA256:new"
+
+    @dataclass
+    class Unpinned:
+        offered: Key = field(default_factory=Key)
+        pinned: list = field(default_factory=list)
+        matches: bool = False
+
+    monkeypatch.setattr(ctun_api, "host_key", lambda name, **kw: asked.append(name) or Unpinned())
+    refused, key = feed.cluster_detail("horeka")["sections"]
+    assert refused == {"title": "Refused", "pairs": [], "lines": ["not pinned"]}
+    assert dict(key["pairs"]) == {"Presented": "ED25519 SHA256:new", "Pinned": "none",
+                                  "Verdict": "not pinned"}
+    assert asked == ["horeka"]       # the key only: no login, no session, no installs
+
+
+def test_a_pending_job_says_it_has_no_output_yet(world):
+    pending = SCONTROL.replace("NumNodes=1", "NumNodes=1-1")
+    ran = _with_runs(world["kcist"], {"scontrol": Result(pending)})
+    slurm, _, output = feed.job_detail({"source": "cluster", "cluster": "kcist", "id": "51901"},
+                                       [])["sections"]
+    assert dict(slurm["pairs"])["Resources"] == "1 node(s), 32 CPUs, 2 GPU(s)"
+    assert output["lines"] == ["no output yet: the job has not started"]
+    assert not any(argv[0] == "tail" for argv in ran)
