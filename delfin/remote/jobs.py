@@ -141,8 +141,7 @@ class Batch:
         for job in self.jobs:
             what = f"ORCA {job.input}" if job.kind == "orca" else "DELFIN workflow"
             lines.append(f"  {job.name}: {what} in {job.folder.name}/ -- {job.cores} cores, "
-                         f"{job.mem_mb // 1024 if job.mem_mb >= 1024 else job.mem_mb}"
-                         f"{' GB' if job.mem_mb >= 1024 else ' MB'}, {job.time}")
+                         f"{_memory(job.mem_mb)}, {job.time}")
         lines.append(f"at most {self.core_hours:g} core-hours"
                      + (f" ({self.requested:g} {self.unit} by the budget's count)"
                         if self.unit and "core" not in self.unit else ""))
@@ -400,6 +399,12 @@ def submit(conn, batch: Batch, *, session_id: str = "", workspace: Any = None,
         done.append(record)
         say(f"{job.name} is job {job_id} on {conn.cluster.name}")
     return done
+
+
+def _memory(mb: int) -> str:
+    """A job's memory as the dialog shows it: the MB sbatch gets below 10 GB,
+    else GB to one decimal (2000 MB is not "1 GB")."""
+    return f"{mb} MB" if mb < 10 * 1024 else f"{mb / 1024:.1f} GB"
 
 
 def _usr1_offset(hours: float) -> int:

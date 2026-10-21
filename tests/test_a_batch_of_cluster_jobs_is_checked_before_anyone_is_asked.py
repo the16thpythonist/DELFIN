@@ -155,7 +155,7 @@ def test_a_workflow_takes_its_resources_from_control(cluster, monkeypatch):
         "small", "complete", 48.0, 6.0)
     text = batch.preview()
     assert "submit 1 job to kcist (me@login.example)" in text
-    assert "fe: DELFIN workflow in fe/ -- 8 cores, 23 GB, 06:00:00" in text
+    assert "fe: DELFIN workflow in fe/ -- 8 cores, 23.4 GB, 06:00:00" in text
     assert "budget: 2.5 of 100 jobh used, 97.5 left" in text
 
 
@@ -167,6 +167,7 @@ def test_an_orca_run_takes_its_resources_from_the_input(cluster, monkeypatch):
     (job,) = batch.jobs
     assert (job.kind, job.input, job.cores, job.mem_mb, job.time) == ("orca", "h2o.inp", 4,
                                                                       4000, "00:30:00")
+    assert "h2o: ORCA h2o.inp in h2o/ -- 4 cores, 4000 MB, 00:30:00" in batch.preview()
 
 
 @pytest.mark.parametrize("request_, files, needle", [
