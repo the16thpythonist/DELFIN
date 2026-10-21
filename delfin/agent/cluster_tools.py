@@ -326,15 +326,18 @@ def submit(executor, perms, *, cluster: Any, jobs: Any) -> str:
         return _login_needed(perms, conn.name, "cluster_submit")
     except RemoteError as exc:
         return _error(exc.code, str(exc))
+    if not batch.ok:
+        # As it was asked: the jobs that passed the checks are not the batch.
+        asked = [str(j.get("folder") or "") if isinstance(j, dict) else "?" for j in jobs]
+        _audit(perms, "cluster_submit", "denied",
+               command=f"submit {len(jobs)} job(s) to {conn.name}: " + ", ".join(asked),
+               reason="; ".join(batch.problems)[:300],
+               extra={"cluster": conn.name, "folders": asked})
+        return _error("batch_refused", "the batch was not submitted, and nobody was asked: "
+                      + "; ".join(batch.problems))
     folders = [str(j.folder) for j in batch.jobs]
     said = f"submit {len(batch.jobs)} job(s) to {conn.name}: " + ", ".join(
         os.path.basename(f) for f in folders)
-    if not batch.ok:
-        _audit(perms, "cluster_submit", "denied", command=said,
-               reason="; ".join(batch.problems)[:300],
-               extra={"cluster": conn.name, "folders": folders})
-        return _error("batch_refused", "the batch was not submitted, and nobody was asked: "
-                      + "; ".join(batch.problems))
     args = {"cluster": conn.name, "jobs": jobs}
     refusal = _ask(executor, perms, "cluster_submit", args, batch.preview())
     if refusal:

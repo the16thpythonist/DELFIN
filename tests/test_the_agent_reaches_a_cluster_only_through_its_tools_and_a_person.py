@@ -354,6 +354,20 @@ def test_a_batch_that_does_not_fit_is_refused_before_asking(world, monkeypatch):
     assert world.asked == [] and world.ran("sbatch") == []
 
 
+def test_a_refused_batch_is_audited_as_it_was_asked(world):
+    """Measured live: an ORCA run without its .inp refused the batch, and the
+    row named only the workflow that had passed the checks."""
+    _folder(world, "fe", WORKFLOW)
+    _folder(world, "sp", {"water.inp": "! HF def2-SVP\n* xyz 0 1\nO 0 0 0\n*\n"})
+    got = _error(world.call("cluster_submit", {"cluster": "kcist", "jobs": [
+        {"folder": "fe"}, {"folder": "sp", "kind": "orca"}]}))
+    assert got["code"] == "batch_refused" and "names its .inp" in got["error"]
+    assert world.asked == [] and world.ran("sbatch") == []
+    (row,) = [r for r in audit_log.read_last_n(20) if r.get("tool") == "cluster_submit"]
+    assert row["decision"] == "denied" and row["command"] == "submit 2 job(s) to kcist: fe, sp"
+    assert row["folders"] == ["fe", "sp"]
+
+
 def test_a_refused_batch_is_not_asked_again_and_nobody_means_no(world):
     _folder(world, "fe", WORKFLOW)
     call = {"cluster": "kcist", "jobs": [{"folder": "fe"}]}
