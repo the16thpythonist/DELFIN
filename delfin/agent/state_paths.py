@@ -771,6 +771,9 @@ USER_STATE_RESOLVERS: tuple[tuple[str, str, str], ...] = (
     ("delfin.agent.session_store", "_handoffs_path", "handoffs"),
     ("delfin.agent.session_store", "_bundles_path", "bundles"),
     ("delfin.agent.attention", "_inbox_path", "attention_inbox.jsonl"),
+    # The jobs DELFIN submitted to a cluster (delfin.remote.jobs), which the
+    # job watcher follows: a run's fixture jobs must not be watched for real.
+    ("delfin.remote.jobs", "_records_path", "remote_jobs.jsonl"),
     # What the user said about themselves, loaded into every prompt. A
     # run reading the real one would test against the developer's own
     # self-description, and a run that drove the Send button would write
