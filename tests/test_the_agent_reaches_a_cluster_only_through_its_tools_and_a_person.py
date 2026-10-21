@@ -44,7 +44,8 @@ import pytest
 
 from cluster_tunnel.api import Decision
 from delfin.agent import api_client as A
-from delfin.agent import attention, audit_log, auto_guard, managed_policy, untrusted
+from delfin.agent import (attention, audit_log, auto_guard, job_monitor, managed_policy,
+                          untrusted)
 from delfin.remote import connection
 
 SHA = "c0ffee" * 6 + "abcd"
@@ -343,6 +344,12 @@ def test_a_batch_is_asked_once_in_every_mode_and_then_submitted(world):
     assert "--comment=delfin-commit=" + SHA in line
     rows = [r for r in audit_log.read_last_n(20) if r.get("tool") == "cluster_submit"]
     assert rows and rows[-1]["decision"] == "ok" and rows[-1]["job_ids"] == ["4242"]
+    # Watched for this session: the job watcher's outcome reaches it.
+    assert got["submitted"][0]["results_to"] == "fe/kcist-4242"
+    assert "END your turn" in got["next"]
+    watches = job_monitor.load_watched(job_monitor._agent_watch_path(world.ws))["jobs"]
+    assert watches["kcist:4242"]["kind"] == "cluster"
+    assert watches["kcist:4242"]["remote_id"] == "4242"
 
 
 def test_a_batch_that_does_not_fit_is_refused_before_asking(world, monkeypatch):

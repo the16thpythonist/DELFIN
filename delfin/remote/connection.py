@@ -116,15 +116,19 @@ class Connection:
         with _ctun_errors(self.name):
             return ctun_api.upload(self.name, src, dest, capture=True, **self._where())
 
-    def download(self, src: str, dest: PathLike):
-        """Copy ``src`` on the cluster to local ``dest`` (rsync -r)."""
+    def download(self, src: str, dest: PathLike, *, extra: Sequence[str] = ()):
+        """Copy ``src`` on the cluster to local ``dest`` (rsync -r; ``extra``
+        are further rsync flags, such as --files-from)."""
         with _ctun_errors(self.name):
-            return ctun_api.download(self.name, src, dest, capture=True, **self._where())
+            return ctun_api.download(self.name, src, dest, extra=list(extra), capture=True,
+                                     **self._where())
 
-    def jobs(self):
-        """The user's Slurm jobs on the cluster: running, pending, recently ended."""
+    def jobs(self, *, since_minutes: Optional[int] = None):
+        """The user's Slurm jobs on the cluster: running, pending, and those
+        that ended in the last ``since_minutes`` (ctun's day by default)."""
+        window = {} if since_minutes is None else {"since_minutes": int(since_minutes)}
         with _ctun_errors(self.name):
-            (entry,) = ctun_api.jobs(self.name, **self._where())
+            (entry,) = ctun_api.jobs(self.name, **window, **self._where())
         if entry.error:
             if not entry.live:
                 raise LoginRequired(f"no live tunnel to {self.name!r}: {entry.error}")

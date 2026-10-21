@@ -1822,7 +1822,10 @@ class AgentEngine:
                     f"{str(ev.get('description', ''))[:80]}"
                     + (f" — signatures: {sig}" if sig else "")
                     + (f" — {degraded}" if degraded else "")
-                    + (f" — {ev['url']}" if ev.get("url") else ""))
+                    + (f" — {ev['url']}" if ev.get("url") else "")
+                    # A cluster job: what became of it and where its
+                    # results came back to (delfin.remote.watch.summary).
+                    + (f" — {ev['results']}" if ev.get("results") else ""))
         except Exception:
             pass
         try:

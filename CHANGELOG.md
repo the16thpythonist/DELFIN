@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — a cluster job's results come back, and the session that sent it is told
+
+- **DELFIN's job watcher** (`delfin/remote/watch.py`) follows every job
+  DELFIN submitted to a cluster (`~/.delfin/remote_jobs.jsonl`). The agent
+  service asks each cluster once a minute with one ctun probe of the user's
+  jobs, and by id for a job the probe no longer lists. When a job ends, its
+  key results come back into `<job folder>/<cluster>-<id>/` in the
+  workspace: DELFIN_Data.json, DELFIN.txt and the report, ORCA outputs,
+  inputs, geometries, logs and the exit marker, also from subfolders, at
+  most 100 MB a file and 500 MB a job. Wave functions, densities and
+  scratch stay on the cluster, and so does the job folder.
+- **The outcome is judged on the fetched copy as on a local run** (exit
+  marker, run log, DELFIN_Data, ORCA's termination line, with Slurm's
+  state): a COMPLETED job whose run failed is reported failed, and a failed
+  one carries the error signatures and job_fix's assessment. A notice goes
+  to NEEDS YOU.
+- **The session that submitted the job is told**: its next turn reads it,
+  a running session wakes at its next idle look, and the service wakes a
+  sleeping session for it. `cluster_submit` registers each job as a watch
+  of the session's (job_monitor's `cluster` kind), says where its results
+  will be, and tells the agent to end its turn instead of polling. A
+  cluster watch outlives the seven-day prune while the job is followed;
+  `/jobs` shows the state the watcher saw.
+- **Also after the PC was off**: the next agent service brings back what
+  ended meanwhile. Without a login it asks for one in NEEDS YOU, saying how
+  many jobs wait, and goes on once logged in. While a followed job is
+  queued or running on a logged-in cluster, the service does not stop for
+  idleness.
+- Slurm's "oom_kill event" line is recognised as out of memory.
+
 ### Added — the agent works on DELFIN's clusters, and a person approves every change there
 
 - **Seven cluster tools** (`delfin/agent/cluster_tools.py`), advertised

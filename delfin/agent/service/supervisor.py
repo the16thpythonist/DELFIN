@@ -46,6 +46,7 @@ import re
 import signal
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -142,6 +143,47 @@ ATTENTION_POLL_S = 2.0
 #: Read again at least this often though nothing changed: a notice
 #: expires, a session elsewhere closes.
 ATTENTION_FULL_S = 60.0
+
+#: How often the jobs DELFIN submitted to its clusters are followed
+#: (delfin.remote.watch), and at once after a login.
+#: DELFIN_AGENT_CLUSTER_WATCH_S sets it.
+CLUSTER_WATCH_S = 60.0
+
+
+def _cluster_watch_every() -> float:
+    try:
+        return max(0.2, float(os.environ.get("DELFIN_AGENT_CLUSTER_WATCH_S") or CLUSTER_WATCH_S))
+    except ValueError:
+        return CLUSTER_WATCH_S
+
+
+def _on_a_daemon_thread(fn, /, *args, **kwargs) -> "asyncio.Future":
+    """``fn`` on a daemon thread of its own, its answer as a future. Not
+    to_thread's pool, which the process's exit waits for: a probe of a slow
+    tunnel must not hold a stopping service after its run file is gone (a
+    tick cut short is done again by the next service)."""
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    def settle(result: Any, exc: BaseException | None) -> None:
+        if not future.done():
+            if exc is not None:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+    def run() -> None:
+        try:
+            result, exc = fn(*args, **kwargs), None
+        except BaseException as caught:        # handed to the awaiting task
+            result, exc = None, caught
+        try:
+            loop.call_soon_threadsafe(settle, result, exc)
+        except RuntimeError:
+            pass                               # the loop has closed: nobody waits
+
+    threading.Thread(target=run, name="delfin-cluster-watch", daemon=True).start()
+    return future
 
 #: Summary changes the roster may take with the next write (half a second
 #: on): a turn's activity, many a second. Every other change -- state,
@@ -661,6 +703,10 @@ class Supervisor:
         self._attention_at = 0.0
         self._attention_titles = attention_feed.Titles()
         self._attention_lock = asyncio.Lock()
+        #: Jobs on a cluster with a live tunnel that the watcher follows: the
+        #: service waits for them rather than stop for idleness.
+        self.cluster_jobs_followed = 0
+        self._watch_now: asyncio.Event | None = None
 
     def spawn(self, coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
@@ -691,12 +737,15 @@ class Supervisor:
         os.chmod(path, 0o600)
         idle = self.spawn(self._watch_idle())
         attention = self.spawn(self._watch_attention())
+        self._watch_now = asyncio.Event()
+        cluster_jobs = self.spawn(self._watch_cluster_jobs())
         try:
             await self.stopping.wait()
         finally:
             self.closing = True
             idle.cancel()
             attention.cancel()
+            cluster_jobs.cancel()
             self.server.close()
             # Said before anything closes: a window leaves (or, for a
             # restart, reconnects) instead of starting a new service.
@@ -1184,9 +1233,12 @@ class Supervisor:
         # in FORWARDED (no worker sees them), go into no event, and
         # clusters_feed.login returns no text that holds them; a failure is
         # answered, not raised, so _dispatch has nothing to echo.
-        return await asyncio.to_thread(clusters_feed.login, str(params["name"]),
-                                       str(params.get("password") or ""),
-                                       str(params.get("otp") or ""))
+        answer = await asyncio.to_thread(clusters_feed.login, str(params["name"]),
+                                         str(params.get("password") or ""),
+                                         str(params.get("otp") or ""))
+        if answer.get("ok") and self._watch_now is not None:
+            self._watch_now.set()     # what waited for this login is followed now
+        return answer
 
     async def _m_cluster_logout(self, _client: Client, params: dict) -> dict:
         return await asyncio.to_thread(clusters_feed.logout, str(params["name"]))
@@ -1201,6 +1253,53 @@ class Supervisor:
         # An agent item's workspace comes from this service's own sessions,
         # never from the window's params.
         return await asyncio.to_thread(clusters_feed.job_detail, params, self._summaries())
+
+    async def _watch_cluster_jobs(self) -> None:
+        """The jobs DELFIN submitted to its clusters, followed every
+        CLUSTER_WATCH_S and at once after a login (delfin.remote.watch, on a
+        thread of its own: a slow tunnel holds no request, and no stop). The
+        session of a job that ended is told: at its next look while it runs,
+        woken if it sleeps."""
+        assert self._watch_now is not None
+        from delfin.remote import watch
+        while True:
+            every = _cluster_watch_every()
+            try:
+                tick = await _on_a_daemon_thread(
+                    watch.tick, probe_every_s=min(watch.PROBE_EVERY_S, every * 0.9))
+            except Exception:
+                tick = None               # asked again at the next tick
+            if self.closing:
+                return
+            if tick is not None:
+                self.cluster_jobs_followed = tick.following
+                for ended in tick.ended:
+                    await self._cluster_job_ended(ended)
+                if tick.ended:
+                    try:
+                        await self._refresh_attention(force=True)
+                    except Exception:
+                        pass
+            try:
+                await asyncio.wait_for(self._watch_now.wait(), every)
+            except asyncio.TimeoutError:
+                pass
+            self._watch_now.clear()
+
+    async def _cluster_job_ended(self, ended: dict) -> None:
+        """Wake the sleeping session that submitted an ended cluster job, so
+        its look at its watches tells it (job_wake). A running session looks
+        by itself; one that cannot be woken reads it when next opened."""
+        from delfin.agent import job_wake
+        sid = str(ended.get("session_id") or "")
+        if not sid or sid in self.sessions or sid not in self.dormant or self.closing:
+            return
+        if not job_wake.wake_enabled():
+            return
+        try:
+            await self._awake(None, sid)
+        except Exception:
+            pass                          # its folder is gone, or it is not saved any more
 
     async def _watch_attention(self) -> None:
         """While a window is there to tell: the attention records looked at
@@ -1402,7 +1501,9 @@ class Supervisor:
         while True:
             await asyncio.sleep(tick)
             self._sleep_unused()
-            if self.sessions or self.starting or self.clients:
+            if self.sessions or self.starting or self.clients or self.cluster_jobs_followed:
+                # A cluster job still queued or running: its results are to
+                # be brought back when it ends, its session told.
                 continue
             # Dormant sessions keep nothing running: they wait in the roster.
             if time.monotonic() - self.quiet_since >= self.idle_exit_s:
@@ -1524,8 +1625,10 @@ class Supervisor:
         while pid and _alive_worker(pid) and time.monotonic() < deadline:
             await asyncio.sleep(0.2)
 
-    async def _awake(self, client: Client, sid: str) -> Session:
-        """The session ``sid`` with a worker: as it runs, or woken."""
+    async def _awake(self, client: Client | None, sid: str) -> Session:
+        """The session ``sid`` with a worker: as it runs, or woken. ``client``
+        None: woken by the service itself, for an event of the session's own
+        (a cluster job of its ended)."""
         session = self.sessions.get(sid)
         if session is not None and session.sleeping:
             # Being asked to sleep right now: it either goes (then it is
@@ -1558,10 +1661,10 @@ class Supervisor:
             raise _Refusal(UNKNOWN_SESSION, f"no session {sid!r} here")
         return session
 
-    async def _wake(self, client: Client, sid: str) -> None:
+    async def _wake(self, client: Client | None, sid: str) -> None:
         if self.closing:
             raise _Refusal(protocol.NOT_ALLOWED, "the agent service is stopping")
-        if not client.may_act:
+        if client is not None and not client.may_act:
             raise _Refusal(protocol.NOT_ALLOWED, "an agent session's own process may not wake a session")
         record = self.dormant[sid]
         await self._old_worker_gone(record)

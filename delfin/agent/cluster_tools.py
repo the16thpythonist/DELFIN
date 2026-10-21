@@ -358,12 +358,37 @@ def submit(executor, perms, *, cluster: Any, jobs: Any) -> str:
         "cluster": conn.name, "folders": folders, "approved": True,
         "job_ids": [d["job_id"] for d in done], "commit": batch.commit,
         "core_hours": batch.core_hours})
+    watched = _watch_submitted(perms, conn.name, done)
+    from delfin.remote import watch
     return json.dumps({"cluster": conn.name, "submitted": [
         {"job_id": d["job_id"], "name": d["name"], "remote_dir": d["remote_dir"],
-         "folder": os.path.relpath(d["folder"], perms.workspace)} for d in done],
+         "folder": os.path.relpath(d["folder"], perms.workspace),
+         "results_to": os.path.relpath(watch.results_dir(d), perms.workspace)} for d in done],
         "notes": batch.notes,
-        "next": "cluster_status shows the jobs; cluster_read and cluster_fetch reach their "
-                "folders (remote_dir)"})
+        "next": (("DELFIN's job watcher follows these jobs: when one ends, its key results "
+                  "come back to results_to and you are told in a later turn. END your turn; "
+                  "do not poll with cluster_status.") if watched else
+                 "cluster_status shows the jobs; cluster_read and cluster_fetch reach their "
+                 "folders (remote_dir)")})
+
+
+def _watch_submitted(perms, cluster: str, done: list[dict]) -> bool:
+    """Each submitted job as a watch of this session's (job_monitor's
+    ``cluster`` kind): the watcher's outcome reaches the session's next turn,
+    or wakes it. Whether all were registered; never raises."""
+    from delfin.agent import job_monitor
+    ok = True
+    for job in done:
+        what = "ORCA run" if job.get("kind") == "orca" else "DELFIN workflow"
+        try:
+            job_monitor.register_agent_job(
+                perms.workspace, f"{cluster}:{job['job_id']}",
+                description=f"{job['name']}: {what} on {cluster}",
+                extra={"kind": "cluster", "cluster": cluster, "remote_id": str(job["job_id"]),
+                       "session_id": str(getattr(perms, "task_session_id", "") or "")})
+        except Exception:
+            ok = False
+    return ok
 
 
 def cancel(executor, perms, *, cluster: Any, job_ids: Any) -> str:
