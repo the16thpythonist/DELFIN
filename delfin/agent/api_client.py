@@ -7395,6 +7395,7 @@ def _no_sandbox_refusal(name: str) -> str:
 _PLAN_READONLY_TOOLS: frozenset[str] = frozenset({
     # Reading the world
     "read_file", "grep_file", "list_files", "find_definition",
+    "cluster_status", "cluster_read",
     "find_references", "notebook_read", "view_image", "read_document",
     "compare_tables", "sum_column", "list_docs", "list_sections",
     "read_section",
@@ -12657,6 +12658,133 @@ _DOC_TOOLS_OPENAI: list[dict[str, Any]] = [
             },
         },
     },
+    # DELFIN's HPC clusters (delfin/agent/cluster_tools.py): advertised only
+    # when remote.clusters names one (tool_unavailable_reason).
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster_status",
+            "description": (
+                "DELFIN's HPC clusters: login, budget, problems; with cluster, "
+                "its jobs and DELFIN install."
+            ),
+            "parameters": {"type": "object",
+                           "properties": {"cluster": {"type": "string"}}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster_read",
+            "description": (
+                "Read a cluster file (first 64 KB, or last tail lines) or list "
+                "a folder; asked outside DELFIN's work dir."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"cluster": {"type": "string"},
+                               "path": {"type": "string"},
+                               "tail": {"type": "integer"}},
+                "required": ["cluster", "path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster_fetch",
+            "description": (
+                "Copy a cluster file or folder into the workspace (dest), at "
+                "most 200 MB."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"cluster": {"type": "string"},
+                               "path": {"type": "string"},
+                               "dest": {"type": "string"}},
+                "required": ["cluster", "path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster_upload",
+            "description": (
+                "Copy workspace files to a folder under the cluster's work dir "
+                "(dest). Asked."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"cluster": {"type": "string"},
+                               "src": {"type": "string"},
+                               "dest": {"type": "string"}},
+                "required": ["cluster", "src"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster_submit",
+            "description": (
+                "Submit DELFIN workflows (folder: input.txt, CONTROL.txt) or "
+                "ORCA runs (input: .inp) as one batch; resources default from "
+                "those files. Asked."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cluster": {"type": "string"},
+                    "jobs": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "folder": {"type": "string"},
+                            "kind": {"type": "string", "enum": ["delfin", "orca"]},
+                            "input": {"type": "string"},
+                            "cores": {"type": "integer"},
+                            "mem_gb": {"type": "number"},
+                            "time": {"type": "string"},
+                            "partition": {"type": "string"},
+                        },
+                        "required": ["folder"],
+                    }},
+                },
+                "required": ["cluster", "jobs"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster_cancel",
+            "description": "Cancel your queued or running jobs on a cluster. Asked.",
+            "parameters": {
+                "type": "object",
+                "properties": {"cluster": {"type": "string"},
+                               "job_ids": {"type": "array",
+                                           "items": {"type": "string"}}},
+                "required": ["cluster", "job_ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster_run",
+            "description": (
+                "Run one command on a cluster's login node (no job submission: "
+                "cluster_submit). Asked every time."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"cluster": {"type": "string"},
+                               "command": {"type": "string"},
+                               "timeout": {"type": "integer"}},
+                "required": ["cluster", "command"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -12954,6 +13082,26 @@ class ToolSurfaceContext:
     # rather than being a second policy that happens to agree with it today.
     session_allowed: frozenset[str] = frozenset()
     session_denied: frozenset[str] = frozenset()
+    # Whether remote.clusters names a cluster: the cluster tools have none
+    # to act on otherwise (connection.connect refuses every name).
+    has_clusters: bool = True
+
+
+#: The tools that act on DELFIN's HPC clusters (cluster_tools.py).
+_CLUSTER_TOOL_NAMES: frozenset[str] = frozenset({
+    "cluster_status", "cluster_read", "cluster_fetch", "cluster_upload",
+    "cluster_submit", "cluster_cancel", "cluster_run"})
+
+
+def _clusters_configured() -> bool:
+    """Whether the user's settings name a cluster (remote.clusters)."""
+    try:
+        from delfin.user_settings import load_settings
+        remote = load_settings().get("remote")
+        block = remote.get("clusters") if isinstance(remote, dict) else None
+        return isinstance(block, dict) and bool(block)
+    except Exception:
+        return False
 
 
 def tool_unavailable_reason(
@@ -13017,6 +13165,8 @@ def tool_unavailable_reason(
         elif needed and not any(b in available for b in needed):
             missing = ", ".join(_office_package_names(needed))
             return f"needs a package that is not installed ({missing})"
+    if base in _CLUSTER_TOOL_NAMES and not ctx.has_clusters:
+        return "no cluster is configured (remote.clusters)"
     return None
 
 
@@ -17625,6 +17775,9 @@ class _DocToolExecutor:
                 return self._execute_bash_output(arguments)
             if name == "bash_kill":
                 return self._execute_bash_kill(arguments)
+
+        if name in _CLUSTER_TOOL_NAMES:
+            return getattr(self, f"_execute_{name}")(arguments, permissions)
 
         if name == "watch_job":
             # Register a long-running job (SLURM id or bash job id) for the
@@ -22803,6 +22956,11 @@ class _DocToolExecutor:
                 old_text = resolved_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             old_text = ""
+        if name == "cluster_fetch":
+            # What lands is a cluster's file or folder, not text the model
+            # wrote: the dialog names where it comes from (cluster_tools).
+            return (f"fetch {args.get('cluster', '')}:{args.get('from', '')} "
+                    f"({args.get('size', '')}) into {args.get('path', '')}")
         if name == "apply_patch":
             # The patch itself IS the change preview — show it verbatim rather
             # than a synthetic old→new content diff (the new content isn't in
@@ -27489,6 +27647,45 @@ class _DocToolExecutor:
             return json.dumps({"error": f"web_search failed: {exc}"})
         return _wrap_untrusted(json.dumps(payload, ensure_ascii=False))
 
+    # -- DELFIN's HPC clusters (cluster_tools.py) ------------------------------
+    # Each names its arguments: the tool's rules -- what is asked, refused,
+    # fenced and audited -- live in cluster_tools, beside the remote layer.
+
+    def _execute_cluster_status(self, arguments: dict, permissions) -> str:
+        from . import cluster_tools
+        return cluster_tools.status(self, permissions, cluster=arguments.get("cluster"))
+
+    def _execute_cluster_read(self, arguments: dict, permissions) -> str:
+        from . import cluster_tools
+        return cluster_tools.read_path(self, permissions, cluster=arguments.get("cluster"),
+                                       path=arguments.get("path"), tail=arguments.get("tail"))
+
+    def _execute_cluster_fetch(self, arguments: dict, permissions) -> str:
+        from . import cluster_tools
+        return cluster_tools.fetch(self, permissions, cluster=arguments.get("cluster"),
+                                   path=arguments.get("path"), dest=arguments.get("dest"))
+
+    def _execute_cluster_upload(self, arguments: dict, permissions) -> str:
+        from . import cluster_tools
+        return cluster_tools.upload(self, permissions, cluster=arguments.get("cluster"),
+                                    src=arguments.get("src"), dest=arguments.get("dest"))
+
+    def _execute_cluster_submit(self, arguments: dict, permissions) -> str:
+        from . import cluster_tools
+        return cluster_tools.submit(self, permissions, cluster=arguments.get("cluster"),
+                                    jobs=arguments.get("jobs"))
+
+    def _execute_cluster_cancel(self, arguments: dict, permissions) -> str:
+        from . import cluster_tools
+        return cluster_tools.cancel(self, permissions, cluster=arguments.get("cluster"),
+                                    job_ids=arguments.get("job_ids"))
+
+    def _execute_cluster_run(self, arguments: dict, permissions) -> str:
+        from . import cluster_tools
+        return cluster_tools.run(self, permissions, cluster=arguments.get("cluster"),
+                                 command=arguments.get("command"),
+                                 timeout=arguments.get("timeout"))
+
     def _execute_web_fetch(self, arguments: dict) -> str:
         url = (arguments.get("url", "") or "").strip()
         timeout_s = int(arguments.get("timeout_s", 15) or 15)
@@ -30932,6 +31129,7 @@ class OpenAIClient(_BaseClient):
                               "run_tests",
                               "watch_job",
                               "session_message",
+                              *_CLUSTER_TOOL_NAMES,
                               "history_search",
                               "history_get",
                               "orchestrate",
@@ -30978,6 +31176,7 @@ class OpenAIClient(_BaseClient):
             session_denied=(
                 getattr(self._permissions, "session_denied_tools", None)
                 or frozenset()),
+            has_clusters=_clusters_configured(),
         )
         advertised_tools = advertisable_tools(advertised_tools, _surface_ctx)
 

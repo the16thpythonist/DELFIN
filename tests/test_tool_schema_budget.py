@@ -241,7 +241,15 @@ _BASELINE_TOKENS = 11_422
 # budget, so the budget moves +42, 10_178 -> 10_220.
 # Both arrived on main the same day; measured together: 10_176 + 11
 # (memory's remember schema) + 44 (make_plot energy_profile) = 10_231.
-_TOKEN_BUDGET = 10_231
+# 2026-10-21: the seven cluster tools (delfin/agent/cluster_tools.py:
+# status, read, fetch, upload, submit, cancel, run), +641. They are
+# advertised only when remote.clusters names a cluster
+# (tool_unavailable_reason), so a session without one pays nothing; a
+# session with one gets the agent's whole way to its clusters. Trimmed
+# before measuring -- descriptions shortened, the batch item's name dropped
+# (a job is named after its folder) -- 689 -> 641. Main measured 10_229, so
+# the budget moves 10_231 -> 10_870.
+_TOKEN_BUDGET = 10_870
 # Capability added after the compaction was measured. The diet ratchet
 # below applies to the surface the diet was measured on — new tools have
 # to justify their own cost (the per-tool cap and the budget above), but
@@ -253,6 +261,8 @@ _POST_COMPACTION_TOOLS = frozenset({
     "fill_series", "merge_pdfs", "split_pdf", "create_pdf", "draft_email",
     "session_message", "session_search", "skill_propose_patch",
     "subagent_message", "show_molecule", "make_plot", "skill_share",
+    "cluster_status", "cluster_read", "cluster_fetch", "cluster_upload",
+    "cluster_submit", "cluster_cancel", "cluster_run",
 })
 
 

@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — the agent works on DELFIN's clusters, and a person approves every change there
+
+- **Seven cluster tools** (`delfin/agent/cluster_tools.py`), advertised
+  only while `remote.clusters` names a cluster: `cluster_status` (logged in
+  or not, budget, jobs, whether the PC's commit is installed),
+  `cluster_read` (a file, its tail, a folder's listing), `cluster_fetch`
+  (into the workspace), `cluster_upload`, `cluster_submit`,
+  `cluster_cancel` and `cluster_run` (one command on the login node).
+- **Whatever changes something on a cluster is asked every time, in every
+  mode** -- bypassPermissions too. With nobody to ask it is refused, a
+  refusal is not asked again in the session, and auto mode queues the call
+  for the user. The status and reading DELFIN's work dir run unasked;
+  reading or fetching elsewhere is asked; `~/.ssh`, `~/.config`, the shell
+  histories and the like, names the secret deny list knows and other
+  users' homes are never read, judged where a path really leads. A fetch
+  writes only where write_file may, asked in the default mode like any
+  write and under diff approval (it stages nothing), and brings no link
+  along.
+- **`cluster_submit` runs DELFIN workflows and single ORCA inputs as Slurm
+  jobs** (`delfin.remote.jobs`). Resources come from CONTROL.txt or the
+  input (PAL, maxcore, job_timeout_hours) as the dashboard reads them. The
+  batch is checked first -- folders in the workspace without links or
+  secrets, the partition, the session's budget (core-hours or job-hours, as
+  the cluster counts) and the managed ceiling, the install -- and refused
+  before anyone is asked when it does not fit. The one dialog per batch
+  shows each job's cores, memory and time, the hours against the budget
+  left, and an install it needs first. Jobs run `submit_delfin.sh` of the
+  PC's commit, which the first submit installs (a published commit only);
+  each is recorded in `~/.delfin/remote_jobs.jsonl` for the job watcher.
+- **`cluster_run` never submits or cancels**: sbatch, srun, salloc and the
+  cluster's guard commands -- also inside `bash -c`, after env, timeout or
+  xargs, in `$(...)`, as ctun's own guard reads a command line -- and
+  scancel are refused and pointed to cluster_submit and cluster_cancel. It
+  passes the bash gate's deny patterns, secret paths, credential prints and
+  the user's deny rules for `bash` and `cluster_run`; an outbound transfer
+  is named in the dialog.
+- **Uploads stay in the work dir**, judged where the destination really
+  leads on the cluster (a link there is refused), with the files named in
+  the dialog; links, secrets and DELFIN's own state never leave the PC. A
+  cancel takes only the user's queued or running jobs, checked before the
+  dialog.
+- Without a login a tool answers `login_required` and leaves a login item
+  in NEEDS YOU; the agent is told never to ask for the password. A managed
+  policy (`clusters`: allowed, auto_install, max_core_hours_per_batch) can
+  keep a cluster out, turn automatic installs off or cap a batch.
+  Everything from a cluster reaches the model fenced as untrusted text;
+  every change and every refused command is in the audit log.
+
 ### Added — the window shows the clusters and the jobs, and logs in without the agent
 
 - **`/clusters` shows every cluster of `remote.clusters`**: logged in,
