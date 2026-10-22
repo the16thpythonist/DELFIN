@@ -64,6 +64,11 @@ sys.exit(subprocess.run(["sh", "-c", " ".join(args[i + 1:])], cwd=os.environ["HO
 _FAKE_SBATCH = """\
 #!/bin/sh
 echo "$PWD $*" >> "$FAKE_STATE/sbatch.log"
+if [ -f "$FAKE_STATE/refuse_after" ] && \
+        [ "$(wc -l < "$FAKE_STATE/sbatch.log")" -gt "$(cat "$FAKE_STATE/refuse_after")" ]; then
+    echo "sbatch: error: QOSMaxSubmitJobPerUserLimit" >&2
+    exit 1
+fi
 echo 4242
 """
 _FAKE_SCANCEL = """\
@@ -254,6 +259,27 @@ def test_with_changes_staged_for_approval_a_fetch_is_asked(world):
     assert [name for name, _ in world.asked] == ["cluster_fetch"]
 
 
+def test_the_home_is_never_fetched_and_a_folders_own_keys_stay_behind(world):
+    """Measured by the review: a fetch of ~ (or a folder above it) carried
+    ~/.ssh along; only the path asked for was judged."""
+    for path in ("~", "~/..", "~/delfin/.."):
+        got = _error(world.call("cluster_fetch", {"cluster": "kcist", "path": path, "dest": "h"},
+                                mode="acceptEdits"))
+        assert got["code"] == "refused", (path, got)
+        assert "private files" in got["error"] or "another user's" in got["error"]
+    assert not (world.ws / "h").exists() and world.asked == []
+    run1 = world.home / "delfin" / "jobs" / "run1"
+    (run1 / ".ssh").mkdir()
+    (run1 / ".ssh" / "id_ed25519").write_text("KEY\n")
+    for name in ("server.pem", ".env", "id_rsa"):
+        (run1 / name).write_text("SECRET\n")
+    got = json.loads(world.call("cluster_fetch", {"cluster": "kcist", "path": "~/delfin/jobs/run1"},
+                                mode="acceptEdits"))
+    fetched = world.ws / got["to"]
+    assert (fetched / "out.log").is_file()
+    assert sorted(p.name for p in fetched.iterdir()) == ["out.log"]
+
+
 # ---------------------------------------------------------------------------
 # cluster_run
 # ---------------------------------------------------------------------------
@@ -350,6 +376,24 @@ def test_a_batch_is_asked_once_in_every_mode_and_then_submitted(world):
     watches = job_monitor.load_watched(job_monitor._agent_watch_path(world.ws))["jobs"]
     assert watches["kcist:4242"]["kind"] == "cluster"
     assert watches["kcist:4242"]["remote_id"] == "4242"
+
+
+def test_a_batch_that_fails_partway_names_and_watches_what_was_submitted(world):
+    """Measured by the review: jobs submitted before a later one failed ran
+    unwatched, and the agent, told only of the failure, could submit them
+    again."""
+    _folder(world, "fe", WORKFLOW)
+    _folder(world, "co", WORKFLOW)
+    (world.state / "refuse_after").write_text("1")
+    got = json.loads(world.call("cluster_submit", {"cluster": "kcist", "jobs": [
+        {"folder": "fe", "time": "1h"}, {"folder": "co", "time": "1h"}]}))
+    assert got["code"] == "partly_submitted" and "QOSMaxSubmitJobPerUserLimit" in got["error"]
+    assert [s["job_id"] for s in got["submitted"]] == ["4242"]
+    assert "do NOT submit them again" in got["next"]
+    watches = job_monitor.load_watched(job_monitor._agent_watch_path(world.ws))["jobs"]
+    assert list(watches) == ["kcist:4242"]
+    row = [r for r in audit_log.read_last_n(20) if r.get("tool") == "cluster_submit"][-1]
+    assert row["decision"] == "error" and row["job_ids"] == ["4242"]
 
 
 def test_a_batch_that_does_not_fit_is_refused_before_asking(world, monkeypatch):

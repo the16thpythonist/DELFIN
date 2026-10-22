@@ -51,10 +51,17 @@ _FAKE_SBATCH = """\
 #!{python}
 import json, os, sys
 keep = ("DELFIN_MODE", "DELFIN_JOB_NAME", "DELFIN_INP_FILE", "DELFIN_REPO", "DELFIN_VENV",
-        "DELFIN_OMPI_HOME", "DELFIN_ORCA_BASE", "DELFIN_STAGE_VENV", "TMPDIR")
-with open(os.path.join(os.environ["FAKE_STATE"], "sbatch.jsonl"), "a") as log:
+        "DELFIN_OMPI_HOME", "DELFIN_ORCA_BASE", "DELFIN_STAGE_VENV", "DELFIN_TMP_FALLBACK",
+        "TMPDIR")
+state = os.environ["FAKE_STATE"]
+with open(os.path.join(state, "sbatch.jsonl"), "a") as log:
     log.write(json.dumps({{"cwd": os.getcwd(), "args": sys.argv[1:],
                           "env": {{k: os.environ.get(k) for k in keep}}}}) + "\\n")
+calls = sum(1 for _ in open(os.path.join(state, "sbatch.jsonl")))
+after = os.path.join(state, "refuse_after")
+if os.path.exists(after) and calls > int(open(after).read()):
+    print("sbatch: error: QOSMaxSubmitJobPerUserLimit", file=sys.stderr)
+    sys.exit(1)
 if os.path.exists(os.path.join(os.environ["FAKE_STATE"], "refuse")):
     print("sbatch: error: Invalid partition name specified", file=sys.stderr)
     sys.exit(1)
@@ -178,7 +185,10 @@ def test_an_orca_run_takes_its_resources_from_the_input(cluster, monkeypatch):
     ({"folder": "fe", "input": "../h2o.inp"}, WORKFLOW, "names its .inp"),
     ({"folder": "fe", "partition": "large"}, WORKFLOW, "not one of ['small', 'batch']"),
     ({"folder": "fe", "time": "UNLIMITED"}, WORKFLOW, "a time limit is needed"),
-    ({"folder": "fe", "cores": 4096}, WORKFLOW, "out of range"),
+    ({"folder": "fe", "cores": 4}, WORKFLOW, "the run uses 8 processes, as CONTROL.txt says"),
+    ({"folder": "fe", "mem_gb": 1}, WORKFLOW, "less than the run needs: 8 processes x maxcore "
+                                             "3000 MB = 24000 MB"),
+    ({"folder": "fe"}, {"input.txt": "x\n", "CONTROL.txt": "PAL=4096\n"}, "out of range"),
 ])
 def test_what_is_wrong_with_a_job_refuses_the_batch(cluster, monkeypatch, request_, files,
                                                      needle):
@@ -270,10 +280,87 @@ def test_an_approved_batch_runs_the_commits_job_script_in_the_jobs_folder(cluste
                            "DELFIN_INP_FILE": "", "DELFIN_REPO": str(install_dir),
                            "DELFIN_VENV": str(install_dir / ".venv"),
                            "DELFIN_OMPI_HOME": "/opt/ompi", "DELFIN_ORCA_BASE": "/opt/orca",
-                           "DELFIN_STAGE_VENV": "0", "TMPDIR": "/tmp"}
+                           "DELFIN_STAGE_VENV": "0", "DELFIN_TMP_FALLBACK": "/tmp",
+                           "TMPDIR": None}
     (record,) = jobs.records(cluster="kcist")
     assert {k: record[k] for k in ("job_id", "session_id", "commit", "kind")} == {
         "job_id": "4242", "session_id": "s1", "commit": SHA, "kind": "delfin"}
+
+
+def test_the_login_nodes_tmpdir_does_not_go_into_the_job(cluster, monkeypatch):
+    """--export=ALL exports sbatch's environment: a TMPDIR of the login node
+    need not exist on a compute node, where the job script then fell back
+    to the network /scratch. The node's own TMPDIR (or SLURM_TMPDIR) wins,
+    then DELFIN_TMP_FALLBACK."""
+    monkeypatch.setenv("TMPDIR", "/tmp/login03-me")
+    cluster.folder("fe", WORKFLOW)
+    conn = cluster.connect(monkeypatch)
+    jobs.submit(conn, _plan(cluster, conn, [{"folder": "fe"}]))
+    (call,) = cluster.sbatch_calls()
+    assert call["env"]["TMPDIR"] is None and call["env"]["DELFIN_TMP_FALLBACK"] == "/tmp"
+
+
+def test_a_control_without_pal_is_allocated_what_delfin_runs(cluster, monkeypatch):
+    from delfin.config import _load_template_defaults
+    defaults = _load_template_defaults()
+    cluster.folder("fe", {"input.txt": "x\n", "CONTROL.txt": "job_timeout_hours=2\n"})
+    (job,) = _plan(cluster, cluster.connect(monkeypatch), [{"folder": "fe"}]).jobs
+    assert job.cores == int(defaults["PAL"])
+    assert job.mem_mb == int(defaults["PAL"]) * int(defaults["maxcore"])
+
+
+def test_more_memory_than_the_run_needs_may_be_asked_for(cluster, monkeypatch):
+    cluster.folder("fe", WORKFLOW)
+    batch = _plan(cluster, cluster.connect(monkeypatch), [{"folder": "fe", "mem_gb": 40}])
+    (job,) = batch.jobs
+    assert job.mem_mb == 40960 and "8 cores, 40.0 GB" in batch.preview()
+
+
+def test_results_brought_back_into_a_folder_are_not_uploaded_again(cluster, monkeypatch):
+    folder = cluster.folder("fe", {**WORKFLOW, "kcist-123/initial.out": "o" * 5000,
+                                   "kcist-123/.delfin-results": "{}"})
+    conn = cluster.connect(monkeypatch)
+    batch = _plan(cluster, conn, [{"folder": "fe"}])
+    (job,) = batch.jobs
+    assert job.paths == ("CONTROL.txt", "input.txt") and job.files == 2
+    (done,) = jobs.submit(conn, batch)
+    remote = cluster.home / done["remote_dir"][2:]
+    assert sorted(p.name for p in remote.iterdir()) == ["CONTROL.txt", "input.txt"]
+    assert (folder / "kcist-123" / "initial.out").exists()
+
+
+def test_a_folder_that_changed_after_the_dialog_is_not_submitted(cluster, monkeypatch):
+    folder = cluster.folder("fe", WORKFLOW)
+    conn = cluster.connect(monkeypatch)
+    batch = _plan(cluster, conn, [{"folder": "fe"}])
+    (folder / ".env").write_text("TOKEN=1\n", encoding="utf-8")   # while the dialog waited
+    with pytest.raises(RemoteError, match=r"changed after the batch was approved \(new: \.env\)"):
+        jobs.submit(conn, batch)
+    assert cluster.sbatch_calls() == [] and jobs.records() == []
+
+
+def test_a_budget_spent_meanwhile_stops_the_batch(cluster, monkeypatch):
+    cluster.folder("fe", WORKFLOW)
+    conn = cluster.connect(monkeypatch)
+    batch = _plan(cluster, conn, [{"folder": "fe"}])
+    monkeypatch.setattr(conn, "budget", lambda: Decision(            # another session's jobs
+        allowed=True, reason="", used=97.0, limit=100.0, unit="jobh"))
+    with pytest.raises(RemoteError, match="the budget changed since the dialog"):
+        jobs.submit(conn, batch)
+    assert cluster.sbatch_calls() == []
+
+
+def test_a_batch_that_fails_partway_says_what_was_submitted(cluster, monkeypatch):
+    cluster.folder("fe", WORKFLOW)
+    cluster.folder("co", WORKFLOW)
+    (cluster.state / "refuse_after").write_text("1")
+    conn = cluster.connect(monkeypatch)
+    batch = _plan(cluster, conn, [{"folder": "fe"}, {"folder": "co"}])
+    with pytest.raises(jobs.PartialSubmit, match=r"job\(s\) 4242 were submitted") as raised:
+        jobs.submit(conn, batch)
+    assert [d["name"] for d in raised.value.done] == ["fe"]
+    assert raised.value.code == "partly_submitted"
+    assert [r["name"] for r in jobs.records()] == ["fe"]
 
 
 def test_a_refusal_by_sbatch_is_said(cluster, monkeypatch):

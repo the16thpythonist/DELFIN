@@ -65,7 +65,7 @@ DONE = {"DELFIN_Data.json": '{"status": "completed", "completed": true}\n',
 class Cluster:
     """The fake cluster the service reaches, and what its Slurm says."""
 
-    def __init__(self, svc: ServiceProcess):
+    def __init__(self, svc: ServiceProcess, *, agent: dict | None = None):
         self.svc = svc
         self.state = svc.tmp / "fake-slurm"
         self.state.mkdir()
@@ -85,7 +85,8 @@ class Cluster:
             "    strict_host_key_checking: 'yes'\n"
             f"    known_hosts_file: {ctun / 'known_hosts'}\n", encoding="utf-8")
         (home / ".delfin_settings.json").write_text(json.dumps({"remote": {"clusters": {
-            "kcist": {"default_partition": "small"}}}}), encoding="utf-8")
+            "kcist": {"default_partition": "small"}}}, **({"agent": agent} if agent else {})}),
+            encoding="utf-8")
         svc.env.update(PATH=f"{bin_dir}:/usr/bin:/bin", FAKE_MASTER=str(self.master),
                        FAKE_STATE=str(self.state), XDG_CONFIG_HOME=str(home / ".config"),
                        XDG_CACHE_HOME=str(home / ".cache"),
@@ -196,3 +197,72 @@ def test_a_job_that_ended_while_no_service_ran_comes_back_with_the_next(service)
     told = _until(lambda: [t for t in _told(c, sid) if "kcist:4242" in t], 90,
                   "the session was told")
     assert "results in fe/kcist-4242" in told[0]
+
+
+
+def test_the_service_waits_for_a_followed_job_and_then_stops(tmp_path):
+    """Idle -- no window, no session -- the service stops after idle_exit;
+    not while a job it follows is queued or running on a logged-in cluster,
+    whose results it is to bring back."""
+    svc = ServiceProcess(tmp_path, idle_exit=3.0, start=False)
+    cluster = Cluster(svc)
+    cluster.running()
+    ws = svc.workspace()
+    cluster.submitted("no-such-session", ws)
+    svc.start()
+    try:
+        time.sleep(8)
+        assert svc.proc.poll() is None, "it stopped while the job ran"
+        cluster.ended()
+        _until(lambda: svc.proc.poll() is not None, 60, "the service stopped once it was back")
+        assert (ws / "fe" / "kcist-4242" / "DELFIN_Data.json").is_file()
+    finally:
+        svc.stop()
+
+
+def test_with_wakes_turned_off_a_sleeping_session_sleeps_on(tmp_path):
+    """agent.wake_on_job_end: false -- the results still come back; the
+    session is not woken for them, and they wait for its next turn."""
+    svc = ServiceProcess(tmp_path, start=False)
+    cluster = Cluster(svc, agent={"wake_on_job_end": False})
+    svc.start()
+    try:
+        cluster.running()
+        c, sid, ws = _asleep_after_a_submit(svc, cluster)
+        cluster.ended()
+        _until((ws / "fe" / "kcist-4242" / "DELFIN_Data.json").is_file, 60, "it came back")
+        time.sleep(3)
+        assert (_row(c, sid) or {}).get("state") == "sleeping"
+        assert not [t for t in _told(c, sid) if "kcist:4242" in t]
+        # Opened again, its worker looks at its watches at once -- and with
+        # wakes off starts no turn of its own: the job is left to the next
+        # turn the user starts, whose start reads it (job_monitor's cluster
+        # watch, tested in test_a_cluster_job_comes_back_to_the_session_...).
+        c.request("session.attach", {"sessionId": sid, "turns": 0}, timeout=120)
+        time.sleep(3)
+        assert not [t for t in _told(c, sid) if "kcist:4242" in t]
+        watches = job_monitor.load_watched(job_monitor._agent_watch_path(ws))["jobs"]
+        assert "kcist:4242" in watches and not watches["kcist:4242"].get("wake_notified")
+    finally:
+        svc.stop()
+
+
+def test_a_login_has_the_watcher_look_at_once(monkeypatch):
+    """What waited for a login is followed right after it, not a minute on."""
+    import asyncio
+    from delfin.agent.service import clusters_feed, supervisor
+    monkeypatch.setattr(clusters_feed, "login", lambda name, password, otp: {
+        "ok": True, "opened": True, "code": None, "error": None})
+
+    async def run() -> tuple[bool, bool]:
+        sup = supervisor.Supervisor()
+        sup._watch_now = asyncio.Event()
+        await sup._m_cluster_login(None, {"name": "kcist", "password": "pw", "otp": ""})
+        looked = sup._watch_now.is_set()
+        sup._watch_now.clear()
+        monkeypatch.setattr(clusters_feed, "login", lambda name, password, otp: {
+            "ok": False, "opened": False, "code": "login_failed", "error": "no"})
+        await sup._m_cluster_login(None, {"name": "kcist", "password": "pw", "otp": ""})
+        return looked, sup._watch_now.is_set()
+
+    assert asyncio.run(run()) == (True, False)

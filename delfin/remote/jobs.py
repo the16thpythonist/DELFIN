@@ -48,6 +48,7 @@ import json
 import os
 import re
 import secrets
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,8 +84,8 @@ if [ -f "$HOME/.delfin_env.sh" ]; then . "$HOME/.delfin_env.sh"; fi
 export DELFIN_MODE="$mode" DELFIN_JOB_NAME="$name" DELFIN_INP_FILE="$inp"
 export DELFIN_REPO="$install" DELFIN_VENV="$install/.venv"
 export DELFIN_OMPI_HOME="${OPENMPI_PREFIX:-}" DELFIN_ORCA_BASE="${ORCA_BASE:-}"
-export DELFIN_STAGE_VENV=0 TMPDIR="${TMPDIR:-/tmp}"
-unset SBATCH_GET_USER_ENV SBATCH_EXPORT
+export DELFIN_STAGE_VENV=0 DELFIN_TMP_FALLBACK=/tmp
+unset SBATCH_GET_USER_ENV SBATCH_EXPORT TMPDIR
 sbatch --parsable --export=ALL "$@" "$install/delfin/submit_templates/submit_delfin.sh"
 '''
 
@@ -109,6 +110,25 @@ class Job:
     hours: float      # the time limit in hours
     files: int
     size: int         # bytes
+    #: The files approved, relative to the folder: what is uploaded, and
+    #: with their sizes and times what must still be there at the upload.
+    paths: tuple[str, ...] = ()
+    fingerprint: tuple[tuple[str, int, int], ...] = ()
+
+
+class PartialSubmit(RemoteError):
+    """A batch that failed after some of its jobs were submitted."""
+
+    code = "partly_submitted"
+
+    def __init__(self, message: str, done: list[dict]):
+        super().__init__(message)
+        self.done = done
+
+
+#: A folder the job watcher brought an ended job's results into
+#: (delfin.remote.watch): never part of a job folder that is uploaded.
+RESULTS_MARKER = ".delfin-results"
 
 
 @dataclass
@@ -254,7 +274,7 @@ def _job(workspace: Path, request: Any, refuse, number: int) -> tuple[Optional[J
         return None, f"job {number}: no folder {raw}"
     if folder == workspace or workspace not in folder.parents or not folder.is_dir():
         return None, f"job {number}: {raw} is not a folder inside the workspace"
-    files, size, problem = _contents(folder, refuse)
+    files, size, problem, paths, fingerprint = _contents(folder, refuse)
     if problem:
         return None, f"job {number}: {problem}"
     kind = str(request.get("kind") or "").strip().lower()
@@ -268,19 +288,32 @@ def _job(workspace: Path, request: Any, refuse, number: int) -> tuple[Optional[J
         missing = [f for f in ("input.txt", "CONTROL.txt") if not (folder / f).is_file()]
         if missing:
             return None, f"job {number}: a DELFIN workflow needs {' and '.join(missing)} in {raw}"
-        pal, maxcore, hours = _control_resources(control.read_text(encoding="utf-8", errors="replace"))
+        pal, maxcore, hours, named = _control_resources(
+            control.read_text(encoding="utf-8", errors="replace"))
+        source = "CONTROL.txt" if named else "DELFIN's default (CONTROL.txt names no PAL)"
         entry = ""
     else:
         if not entry or "/" in entry or not entry.endswith(".inp") or not (folder / entry).is_file():
             return None, f"job {number}: an ORCA run names its .inp in {raw} (input), not {entry!r}"
         pal, maxcore = _inp_resources((folder / entry).read_text(encoding="utf-8", errors="replace"))
-        hours = None
+        source = entry if pal else f"{entry} (no %pal: ORCA runs one process)"
+        pal, maxcore, hours = pal or 1, maxcore or DEFAULT_MAXCORE, None
+    # The run takes its processes and memory from its own file -- DELFIN
+    # from CONTROL.txt (or its defaults), ORCA from the input -- so the
+    # allocation follows the file; an override that disagrees would be an
+    # allocation the run does not use.
     try:
-        cores = int(request.get("cores") or pal or 1)
-        mem_mb = int(float(request["mem_gb"]) * 1024) if request.get("mem_gb") else \
-            cores * int(maxcore or DEFAULT_MAXCORE)
+        needed = pal * maxcore
+        cores = int(request["cores"]) if request.get("cores") else pal
+        mem_mb = int(float(request["mem_gb"]) * 1024) if request.get("mem_gb") else needed
     except (TypeError, ValueError):
         return None, f"job {number}: cores and mem_gb are numbers"
+    if cores != pal:
+        return None, (f"job {number}: cores={cores}, but the run uses {pal} processes, as "
+                      f"{source} says; change it there, or leave cores out")
+    if mem_mb < needed:
+        return None, (f"job {number}: mem_gb={mem_mb / 1024:g} is less than the run needs: "
+                      f"{pal} processes x maxcore {maxcore} MB = {needed} MB")
     if not 1 <= cores <= 512 or not 100 <= mem_mb <= 4 * 1024 * 1024:
         return None, f"job {number}: {cores} cores and {mem_mb} MB are out of range"
     from delfin.slurm_submit import normalize_time_limit, time_limit_seconds
@@ -295,38 +328,59 @@ def _job(workspace: Path, request: Any, refuse, number: int) -> tuple[Optional[J
         return None, f"job {number}: a time limit is needed, not {given!r}"
     name = _SLUG.sub("-", str(request.get("name") or folder.name)).strip("-.")[:40] or "delfin"
     return Job(folder=folder, kind=kind, input=entry, name=name, cores=cores, mem_mb=mem_mb,
-               time=limit, hours=round(seconds / 3600, 2), files=files, size=size), ""
+               time=limit, hours=round(seconds / 3600, 2), files=files, size=size,
+               paths=paths, fingerprint=fingerprint), ""
 
 
-def _contents(folder: Path, refuse) -> tuple[int, int, str]:
+def _contents(folder: Path, refuse):
+    """(files, bytes, problem, paths, fingerprint) of a job folder as it would
+    be uploaded: no link, every file past ``refuse``, within the limits; the
+    results a watcher brought back into it (RESULTS_MARKER) are no part of it."""
     files = size = 0
+    paths, fingerprint = [], []
     for root, dirs, names in os.walk(folder):
+        dirs[:] = [d for d in dirs if (Path(root) / d).is_symlink()
+                   or not (Path(root) / d / RESULTS_MARKER).is_file()]
         for name in dirs + names:
             path = Path(root) / name
             if path.is_symlink():
                 return 0, 0, (f"{path.relative_to(folder)} is a link; uploads copy no links "
-                              "(rsync -r): put the file itself there")
+                              "(rsync -r): put the file itself there"), (), ()
         for name in names:
             path = Path(root) / name
             if refuse is not None:
                 why = refuse(path)
                 if why:
-                    return 0, 0, f"{path.relative_to(folder)}: {why}"
+                    return 0, 0, f"{path.relative_to(folder)}: {why}", (), ()
+            st = path.stat()
+            rel = path.relative_to(folder).as_posix()
             files += 1
-            size += path.stat().st_size
+            size += st.st_size
+            paths.append(rel)
+            fingerprint.append((rel, st.st_size, st.st_mtime_ns))
             if files > MAX_FILES or size > MAX_BYTES:
                 return 0, 0, (f"{folder.name} holds more than {MAX_FILES} files or "
-                              f"{MAX_BYTES // (1024 * 1024)} MB; a job folder carries its inputs")
+                              f"{MAX_BYTES // (1024 * 1024)} MB; a job folder carries its inputs"), \
+                    (), ()
     if not files:
-        return 0, 0, f"{folder.name} is empty"
-    return files, size, ""
+        return 0, 0, f"{folder.name} is empty", (), ()
+    return files, size, "", tuple(sorted(paths)), tuple(sorted(fingerprint))
 
 
-def _control_resources(text: str) -> tuple[Optional[int], Optional[int], Optional[int]]:
+def _control_resources(text: str) -> tuple[int, int, Optional[int], bool]:
+    """PAL and maxcore as the run uses them -- CONTROL.txt's, else DELFIN's
+    defaults (the template's, as delfin.config.read_control_file fills them)
+    -- its job_timeout_hours, and whether CONTROL.txt names PAL."""
     from delfin.agent.job_fix import parse_pal_maxcore
     pal, maxcore = parse_pal_maxcore(text)
     found = re.search(r"^\s*job_timeout_hours\s*=\s*(\d+)", text, flags=re.MULTILINE)
-    return pal, maxcore, int(found.group(1)) if found else None
+    defaults: dict = {}
+    if not (pal and maxcore):
+        from delfin.config import _load_template_defaults
+        defaults = _load_template_defaults()
+    return (int(pal or defaults.get("PAL") or 1),
+            int(maxcore or defaults.get("maxcore") or DEFAULT_MAXCORE),
+            int(found.group(1)) if found else None, bool(pal))
 
 
 def _inp_resources(text: str) -> tuple[Optional[int], Optional[int]]:
@@ -364,41 +418,97 @@ def submit(conn, batch: Batch, *, session_id: str = "", workspace: Any = None,
             raise RemoteError(f"DELFIN {batch.commit[:12]} is still installing on "
                               f"{conn.cluster.name}; nothing was submitted -- submit again once "
                               "it is installed")
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    done = []
+    # What was approved is what goes: each folder as the dialog counted it,
+    # and the budget as it stands now -- a dialog and an install take time.
     for job in batch.jobs:
-        remote_dir = (f"{conn.cluster.work_dir.rstrip('/')}/{stamp}-{secrets.token_hex(2)}-"
-                      f"{job.name}")
-        relative = remote_dir[2:] if remote_dir.startswith("~/") else remote_dir
-        say(f"uploading {job.folder.name} to {conn.cluster.name}:{remote_dir}")
-        made = conn.run(["mkdir", "-p", relative])
-        if not made.ok:
-            raise RemoteError(f"cannot create {remote_dir}: {(made.stderr or '').strip()}")
-        sent = conn.upload(f"{job.folder}/", f"{relative}/")
-        if not sent.ok:
-            raise RemoteError(f"uploading {job.folder.name} failed: {(sent.stderr or '').strip()}")
-        options = [f"--job-name={job.name}", f"--partition={batch.partition}", "--ntasks=1",
-                   f"--cpus-per-task={job.cores}", f"--mem={job.mem_mb}M", f"--time={job.time}",
-                   f"--signal=B:USR1@{_usr1_offset(job.hours)}",
-                   f"--comment={_install.job_comment(batch.commit)}"]
-        result = conn.run(["bash", "-c", _SUBMIT, "delfin-submit", remote_dir, install_dir,
-                           job.kind, job.input, job.name, *options])
-        said = (result.stdout or "").strip().splitlines() if result.ok else []
-        job_id = said[-1].split(";")[0] if said else ""
-        if not _JOB_ID.fullmatch(job_id):
-            raise RemoteError(f"sbatch did not take {job.name}: "
-                              f"{(result.stderr or result.stdout or '').strip()}"
-                              + (f" (submitted before it: {[d['job_id'] for d in done]})"
-                                 if done else ""))
-        record = {"cluster": conn.cluster.name, "job_id": job_id, "name": job.name,
-                  "kind": job.kind, "input": job.input, "remote_dir": remote_dir,
-                  "folder": str(job.folder), "workspace": str(workspace or ""),
-                  "session_id": session_id, "commit": batch.commit,
-                  "submitted_at": time.time()}
-        _record(record)
-        done.append(record)
-        say(f"{job.name} is job {job_id} on {conn.cluster.name}")
+        changed = _changed_since_approval(job)
+        if changed:
+            raise RemoteError(f"{job.folder.name} changed after the batch was approved "
+                              f"({changed}); nothing was submitted -- submit it again to be "
+                              "asked about it as it is now")
+    if batch.limit is not None:
+        decision = conn.budget()
+        if (decision.limit is not None
+                and float(decision.used or 0) + batch.requested > float(decision.limit)):
+            raise RemoteError(
+                f"the budget changed since the dialog: the batch may use {batch.requested:g} "
+                f"{batch.unit}, {max(0.0, float(decision.limit) - float(decision.used or 0)):g} "
+                f"of {float(decision.limit):g} are left; nothing was submitted")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    done: list[dict] = []
+    for job in batch.jobs:
+        try:
+            done.append(_submit_one(conn, batch, job, stamp=stamp, install_dir=install_dir,
+                                    session_id=session_id, workspace=workspace, say=say))
+        except RemoteError as exc:
+            if not done:
+                raise
+            ids = ", ".join(d["job_id"] for d in done)
+            raise PartialSubmit(f"{exc} -- before it, job(s) {ids} were submitted and run: "
+                                "submit only the rest again", done) from exc
     return done
+
+
+def _submit_one(conn, batch: Batch, job: Job, *, stamp: str, install_dir: str,
+                session_id: str, workspace: Any, say) -> dict:
+    """Upload one approved job folder -- exactly its approved files -- and
+    sbatch it; its record."""
+    remote_dir = (f"{conn.cluster.work_dir.rstrip('/')}/{stamp}-{secrets.token_hex(2)}-"
+                  f"{job.name}")
+    relative = remote_dir[2:] if remote_dir.startswith("~/") else remote_dir
+    say(f"uploading {job.folder.name} to {conn.cluster.name}:{remote_dir}")
+    made = conn.run(["mkdir", "-p", relative])
+    if not made.ok:
+        raise RemoteError(f"cannot create {remote_dir}: {(made.stderr or '').strip()}")
+    fd, names = tempfile.mkstemp(prefix="delfin-upload-", suffix=".list")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(b"".join(p.encode("utf-8", "surrogateescape") + b"\0" for p in job.paths))
+        sent = conn.upload(f"{job.folder}/", f"{relative}/",
+                           extra=["--from0", f"--files-from={names}"])
+    finally:
+        os.unlink(names)
+    if not sent.ok:
+        raise RemoteError(f"uploading {job.folder.name} failed: {(sent.stderr or '').strip()}")
+    options = [f"--job-name={job.name}", f"--partition={batch.partition}", "--ntasks=1",
+               f"--cpus-per-task={job.cores}", f"--mem={job.mem_mb}M", f"--time={job.time}",
+               f"--signal=B:USR1@{_usr1_offset(job.hours)}",
+               f"--comment={_install.job_comment(batch.commit)}"]
+    result = conn.run(["bash", "-c", _SUBMIT, "delfin-submit", remote_dir, install_dir,
+                       job.kind, job.input, job.name, *options])
+    said = (result.stdout or "").strip().splitlines() if result.ok else []
+    job_id = said[-1].split(";")[0] if said else ""
+    if not _JOB_ID.fullmatch(job_id):
+        raise RemoteError(f"sbatch did not take {job.name}: "
+                          f"{(result.stderr or result.stdout or '').strip()}")
+    record = {"cluster": conn.cluster.name, "job_id": job_id, "name": job.name,
+              "kind": job.kind, "input": job.input, "remote_dir": remote_dir,
+              "folder": str(job.folder), "workspace": str(workspace or ""),
+              "session_id": session_id, "commit": batch.commit,
+              "submitted_at": time.time()}
+    _record(record)
+    say(f"{job.name} is job {job_id} on {conn.cluster.name}")
+    return record
+
+
+def _changed_since_approval(job: Job) -> str:
+    """What differs in a job folder from the files approved; "" for nothing."""
+    _, _, problem, _, fingerprint = _contents(job.folder, None)
+    if problem:
+        return problem
+    if fingerprint == job.fingerprint:
+        return ""
+    before = {p: (s, m) for p, s, m in job.fingerprint}
+    now = {p: (s, m) for p, s, m in fingerprint}
+    parts = []
+    for what, names in (("new", sorted(set(now) - set(before))),
+                        ("gone", sorted(set(before) - set(now))),
+                        ("changed", sorted(p for p in set(now) & set(before)
+                                           if now[p] != before[p]))):
+        if names:
+            parts.append(f"{what}: {', '.join(names[:3])}"
+                         + (f" and {len(names) - 3} more" if len(names) > 3 else ""))
+    return "; ".join(parts)
 
 
 def _memory(mb: int) -> str:

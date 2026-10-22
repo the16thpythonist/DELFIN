@@ -111,10 +111,12 @@ class Connection:
             return ctun_api.feed_script(self.name, script, args, timeout=timeout,
                                         **self._where())
 
-    def upload(self, src: PathLike, dest: str):
-        """Copy local ``src`` to ``dest`` on the cluster (rsync -r)."""
+    def upload(self, src: PathLike, dest: str, *, extra: Sequence[str] = ()):
+        """Copy local ``src`` to ``dest`` on the cluster (rsync -r; ``extra``
+        are further rsync flags, such as --files-from)."""
         with _ctun_errors(self.name):
-            return ctun_api.upload(self.name, src, dest, capture=True, **self._where())
+            return ctun_api.upload(self.name, src, dest, extra=list(extra), capture=True,
+                                   **self._where())
 
     def download(self, src: str, dest: PathLike, *, extra: Sequence[str] = ()):
         """Copy ``src`` on the cluster to local ``dest`` (rsync -r; ``extra``

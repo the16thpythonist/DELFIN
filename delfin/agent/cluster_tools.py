@@ -73,6 +73,10 @@ _PRIVATE = (".ssh", ".config", ".gnupg", ".delfin", ".delfin_settings.json", ".n
             ".aws", ".kube", ".docker", ".git-credentials", ".pgpass", ".bash_history",
             ".zsh_history", ".python_history")
 
+#: Left out of a fetched folder wherever they are in it, beside _PRIVATE.
+_KEYS = ("*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*",
+         ".env", ".env.*", ".npmrc", ".pypirc")
+
 #: The submitting commands cluster_run never runs, beside the cluster's own
 #: guard_commands, and the one that cancels.
 _SUBMIT = ("sbatch", "srun", "salloc")
@@ -224,7 +228,9 @@ def fetch(executor, perms, *, cluster: Any, path: Any, dest: Any = None) -> str:
             return refusal
     local.parent.mkdir(parents=True, exist_ok=True)
     try:
-        got = (conn.download(f"{real}/", f"{local}/") if kind == "dir"
+        # A folder's own copies of private names and keys stay behind too.
+        got = (conn.download(f"{real}/", f"{local}/", extra=[
+                   f"--exclude={name}" for name in _PRIVATE + _KEYS]) if kind == "dir"
                else conn.download(real, str(local)))
     except LoginRequired:
         return _login_needed(perms, conn.name, "cluster_fetch")
@@ -349,6 +355,19 @@ def submit(executor, perms, *, cluster: Any, jobs: Any) -> str:
                                   workspace=perms.workspace)
     except LoginRequired:
         return _login_needed(perms, conn.name, "cluster_submit")
+    except remote_jobs.PartialSubmit as exc:
+        # The jobs submitted before the failure run: watched like any, and
+        # named, so that they are not submitted twice.
+        ids = [d["job_id"] for d in exc.done]
+        _audit(perms, "cluster_submit", "error", command=f"{said} -> jobs {', '.join(ids)}",
+               reason=str(exc)[:300], extra={"cluster": conn.name, "folders": folders,
+                                             "approved": True, "job_ids": ids})
+        _watch_submitted(perms, conn.name, exc.done)
+        return json.dumps({"error": str(exc), "code": exc.code, "cluster": conn.name,
+                           "submitted": _submitted(perms, exc.done),
+                           "next": ("the submitted jobs run and are watched: do NOT submit "
+                                    "them again. Tell the user which were not submitted, and "
+                                    "why.")}, ensure_ascii=False)
     except RemoteError as exc:
         _audit(perms, "cluster_submit", "error", command=said, reason=str(exc)[:300],
                extra={"cluster": conn.name, "folders": folders, "approved": True})
@@ -359,17 +378,23 @@ def submit(executor, perms, *, cluster: Any, jobs: Any) -> str:
         "job_ids": [d["job_id"] for d in done], "commit": batch.commit,
         "core_hours": batch.core_hours})
     watched = _watch_submitted(perms, conn.name, done)
-    from delfin.remote import watch
-    return json.dumps({"cluster": conn.name, "submitted": [
-        {"job_id": d["job_id"], "name": d["name"], "remote_dir": d["remote_dir"],
-         "folder": os.path.relpath(d["folder"], perms.workspace),
-         "results_to": os.path.relpath(watch.results_dir(d), perms.workspace)} for d in done],
+    return json.dumps({"cluster": conn.name, "submitted": _submitted(perms, done),
         "notes": batch.notes,
         "next": (("DELFIN's job watcher follows these jobs: when one ends, its key results "
                   "come back to results_to and you are told in a later turn. END your turn; "
                   "do not poll with cluster_status.") if watched else
                  "cluster_status shows the jobs; cluster_read and cluster_fetch reach their "
                  "folders (remote_dir)")})
+
+
+def _submitted(perms, done: list[dict]) -> list[dict]:
+    """The submitted jobs as the model reads them: id, name, both folders and
+    where the watcher brings the results."""
+    from delfin.remote import watch
+    return [{"job_id": d["job_id"], "name": d["name"], "remote_dir": d["remote_dir"],
+             "folder": os.path.relpath(d["folder"], perms.workspace),
+             "results_to": os.path.relpath(watch.results_dir(d), perms.workspace)}
+            for d in done]
 
 
 def _watch_submitted(perms, cluster: str, done: list[dict]) -> bool:
@@ -592,6 +617,11 @@ def _place(executor, perms, conn, path: Any, tool: str, args: dict):
     if (_inside(real, _homes(home)) and not _inside(real, home)
             and not _inside(real, work)):
         return None, _error("refused", f"{real} is another user's; it is never read or fetched")
+    if tool == "cluster_fetch" and kind == "dir" and _inside(home, real):
+        # The home, or a folder holding it: a fetch would carry ~/.ssh and
+        # the rest of _PRIVATE along.
+        return None, _error("refused", f"{real} holds the account's private files (~/.ssh "
+                            "and the like); fetch a folder below them, such as a job folder")
     if not _inside(real, work):
         verb = "read" if tool == "cluster_read" else "fetch"
         refusal = _ask(executor, perms, tool, args,

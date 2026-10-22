@@ -15,14 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   jobs, and by id for a job the probe no longer lists. When a job ends, its
   key results come back into `<job folder>/<cluster>-<id>/` in the
   workspace: DELFIN_Data.json, DELFIN.txt and the report, ORCA outputs,
-  inputs, geometries, logs and the exit marker, also from subfolders, at
-  most 100 MB a file and 500 MB a job. Wave functions, densities and
-  scratch stay on the cluster, and so does the job folder.
+  inputs, geometries, logs and the exit marker, the folder's own before its
+  subfolders', at most 100 MB a file and 500 MB a job. Wave functions,
+  densities and scratch stay on the cluster, and so does the job folder; a
+  resubmit of the job folder leaves the fetched results out. A fetch that
+  fails is tried again over about a day.
 - **The outcome is judged on the fetched copy as on a local run** (exit
   marker, run log, DELFIN_Data, ORCA's termination line, with Slurm's
-  state): a COMPLETED job whose run failed is reported failed, and a failed
-  one carries the error signatures and job_fix's assessment. A notice goes
-  to NEEDS YOU.
+  state): a COMPLETED job whose run failed is reported failed, one whose
+  success DELFIN's files cannot confirm "unverified", and a failed one
+  carries the error signatures and job_fix's assessment. A notice goes to
+  NEEDS YOU; nothing a job wrote reaches the session's prompt.
 - **The session that submitted the job is told**: its next turn reads it,
   a running session wakes at its next idle look, and the service wakes a
   sleeping session for it. `cluster_submit` registers each job as a watch
@@ -32,9 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/jobs` shows the state the watcher saw.
 - **Also after the PC was off**: the next agent service brings back what
   ended meanwhile. Without a login it asks for one in NEEDS YOU, saying how
-  many jobs wait, and goes on once logged in. While a followed job is
-  queued or running on a logged-in cluster, the service does not stop for
-  idleness.
+  many jobs wait (at most twice a day), and goes on once logged in; the
+  jobs of a cluster that stays out of reach are given up after 30 days.
+  While a followed job is queued or running on a logged-in cluster, the
+  service does not stop for idleness.
 - Slurm's "oom_kill event" line is recognised as out of memory.
 
 ### Added — the agent works on DELFIN's clusters, and a person approves every change there
@@ -51,21 +55,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the user. The status and reading DELFIN's work dir run unasked;
   reading or fetching elsewhere is asked; `~/.ssh`, `~/.config`, the shell
   histories and the like, names the secret deny list knows and other
-  users' homes are never read, judged where a path really leads. A fetch
-  writes only where write_file may, asked in the default mode like any
-  write and under diff approval (it stages nothing), and brings no link
-  along.
+  users' homes are never read, judged where a path really leads, and a
+  folder that holds them (the home) is never fetched. A fetch writes only
+  where write_file may, asked in the default mode like any write and under
+  diff approval (it stages nothing), and brings no link along, nor a
+  folder's own keys and `.env` files.
 - **`cluster_submit` runs DELFIN workflows and single ORCA inputs as Slurm
-  jobs** (`delfin.remote.jobs`). Resources come from CONTROL.txt or the
-  input (PAL, maxcore, job_timeout_hours) as the dashboard reads them. The
-  batch is checked first -- folders in the workspace without links or
-  secrets, the partition, the session's budget (core-hours or job-hours, as
-  the cluster counts) and the managed ceiling, the install -- and refused
-  before anyone is asked when it does not fit. The one dialog per batch
-  shows each job's cores, memory and time, the hours against the budget
-  left, and an install it needs first. Jobs run `submit_delfin.sh` of the
-  PC's commit, which the first submit installs (a published commit only);
-  each is recorded in `~/.delfin/remote_jobs.jsonl` for the job watcher.
+  jobs** (`delfin.remote.jobs`). Resources are what the run uses: CONTROL.txt
+  (or DELFIN's defaults where it names none) or the input -- PAL, maxcore,
+  job_timeout_hours; more memory may be asked for, other cores or less
+  memory are refused. The batch is checked first -- folders in the
+  workspace without links or secrets, the partition, the session's budget
+  (core-hours or job-hours, as the cluster counts) and the managed ceiling,
+  the install -- and refused before anyone is asked when it does not fit.
+  The one dialog per batch shows each job's cores, memory and time, the
+  hours against the budget left, and an install it needs first. What was
+  approved is what goes: the folders are checked again for the files the
+  dialog counted, and the budget, before the first sbatch, and exactly
+  those files are uploaded. A batch that fails partway names, and watches,
+  the jobs it submitted. Jobs run `submit_delfin.sh` of the PC's commit,
+  which the first submit installs (a published commit only), on the compute
+  node's own TMPDIR or else its /tmp -- never the login node's TMPDIR; each
+  is recorded in `~/.delfin/remote_jobs.jsonl` for the job watcher.
 - **`cluster_run` never submits or cancels**: sbatch, srun, salloc and the
   cluster's guard commands -- also inside `bash -c`, after env, timeout or
   xargs, in `$(...)`, as ctun's own guard reads a command line -- and

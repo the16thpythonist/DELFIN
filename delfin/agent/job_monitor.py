@@ -1342,6 +1342,10 @@ def check_agent_workspaces_once(settings: dict | None = None) -> list[dict]:
         state = str(item.get("state") or "")
         if state == STATE_UNAVAILABLE:
             continue        # degradation is reported in-turn, not notified
+        if item.get("kind") == "cluster":
+            # delfin.remote.watch noticed it already, judged on the results
+            # it brought back; a diagnosis here would read the workspace.
+            continue
         jid = str(item.get("job_id") or "?")
         if item.get("ok"):
             _emit_watch_attention(

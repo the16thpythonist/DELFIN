@@ -14,21 +14,27 @@ Semantics:
 * ``tick`` follows each job that has not ended. Per cluster with a live
   tunnel: one probe of the user's jobs (active, and ended since the oldest
   open job was submitted); a job the probe does not list is asked for by id.
-  A cluster without a live tunnel is left alone, with one login item while
-  jobs wait there; a cluster the managed policy keeps out is not asked.
-  Ticks run one at a time across processes (a lock file).
+  A cluster without a live tunnel is left alone, and NEEDS YOU is asked for
+  a login at most every LOGIN_ASK_EVERY_S while jobs wait there; a cluster
+  the managed policy keeps out is not asked. Either way its jobs are given
+  up after GIVE_UP_DAYS. Ticks run one at a time across processes (a lock).
 * A job has ended at a terminal Slurm state. Its key results then come back
   into ``<job folder>/<cluster>-<id>/`` in the workspace: the files ``KEEP``
-  names, by importance, at most FILE_BYTES each and FETCH_BYTES in all.
-  Wave functions, densities and scratch (``SKIP``) stay on the cluster, as
-  does the job folder there; no link comes along (rsync -r copies none).
+  names, by importance, the folder's own before its subfolders', at most
+  FILE_BYTES each and FETCH_BYTES in all. Wave functions, densities and
+  scratch (``SKIP``) stay on the cluster, as does the job folder there; no
+  link comes along (rsync -r copies none). The results folder is marked
+  (``jobs.RESULTS_MARKER``): a resubmit of the job folder leaves it out.
 * The outcome is judged on the fetched copy as on a local run
   (``api.calculation_status``: exit marker, run log, DELFIN_Data, ORCA's
-  termination line) together with Slurm's state; a failed job gets the error
-  signatures and job_fix's assessment of that copy.
-* A fetch that fails (the tunnel went, the folder is gone) is tried again on
-  later ticks, FETCH_TRIES times in all; then the job is reported with the
-  reason and its results left on the cluster.
+  termination line) together with Slurm's state: ok when Slurm says
+  COMPLETED and DELFIN's files say it succeeded, failed when either says it
+  failed, unverified when Slurm says COMPLETED and the files cannot say. A
+  job not ok gets the error signatures and job_fix's assessment of the copy.
+* A fetch that fails (the tunnel went, a disk is full, the folder is gone)
+  is tried again later, spread out over about a day (``_retry_after``),
+  FETCH_TRIES times in all; then the job is reported with the reason and
+  its results left on the cluster.
 * Each ended job is in exactly one tick's ``ended``; ``outcome`` serves it
   to its session from then on (job_monitor's cluster watches). A job about
   which no answer came for GIVE_UP_DAYS is given up and reported so.
@@ -55,10 +61,16 @@ from .errors import LoginRequired, RemoteError
 PROBE_EVERY_S = 55
 FILE_BYTES = 100 * 1024 * 1024
 FETCH_BYTES = 500 * 1024 * 1024
-#: Files a job folder may list for a fetch (a runaway job writes thousands).
+#: Files a job folder may list for a fetch (a runaway job writes thousands);
+#: its own files are listed first, its subfolders' after them.
 LIST_FILES = 5000
-FETCH_TRIES = 5
+#: Fetches of an ended job's results, spread out (``_retry_after``): about a
+#: day from the first to the last, so an outage of the cluster or the disk
+#: does not lose them.
+FETCH_TRIES = 8
 GIVE_UP_DAYS = 30
+#: How often NEEDS YOU is asked for a login a cluster's open jobs wait for.
+LOGIN_ASK_EVERY_S = 12 * 3600
 
 #: Slurm's states of a job that has ended (squeue and sacct names).
 ENDED = frozenset({"COMPLETED", "FAILED", "TIMEOUT", "CANCELLED", "OUT_OF_MEMORY",
@@ -77,7 +89,8 @@ SKIP = ("*.gbw", "*.densities", "*.densitiesinfo", "*.tmp", "*.tmp.*", "*.cube",
 #: Runs on the cluster in the job's folder: its regular files, size and
 #: path, NUL-separated (a name may hold anything but NUL).
 _LIST = r'''cd -- "$1" 2>/dev/null || exit 3
-find . -maxdepth 4 -type f -printf '%s\t%P\0' 2>/dev/null | head -z -n "$2"
+{ find . -maxdepth 1 -type f -printf '%s\t%P\0'
+  find . -mindepth 2 -maxdepth 4 -type f -printf '%s\t%P\0'; } 2>/dev/null | head -z -n "$2"
 '''
 
 _NAME = re.compile(r"[^A-Za-z0-9._-]+")
@@ -145,33 +158,45 @@ def tick(*, now: Optional[float] = None, probe_every_s: Optional[float] = None) 
                 out.following += sum(1 for r in records
                                      if (known.get(_key(r)) or {}).get("state") not in ENDED)
                 continue
-            if _follow(name, records, known, now, out):
+            if _follow(name, records, state, now, out):
                 probes[name] = now
         _save(state)
     return out
 
 
-def _follow(name: str, records: list[dict], known: dict, now: float, out: Tick) -> bool:
-    """One step for a cluster's open jobs; whether its Slurm was asked."""
+def _follow(name: str, records: list[dict], state: dict, now: float, out: Tick) -> bool:
+    """One step for a cluster's open jobs; whether its Slurm was asked. A
+    cluster that cannot be asked keeps its jobs until they are old enough to
+    give up."""
     from delfin.agent import managed_policy
     from . import attention as remote_attention
     from . import connection, slurm
+    known = state.setdefault("jobs", {})
     if not managed_policy.cluster_allowed(name):
+        for record in records:
+            _give_up_if_old(record, known, now, out, f"a managed policy keeps {name} out")
         return False
     try:
         conn = connection.connect(name)
         live = conn.is_live()
     except RemoteError as exc:
-        # Not usable (its settings changed): asked again, until its jobs
-        # are old enough to give up.
+        # Not usable (its settings changed): asked again next tick.
         for record in records:
             _give_up_if_old(record, known, now, out, f"{name} is not usable ({exc})")
         return False
     if not live:
-        out.waiting_for_login.append(name)
-        remote_attention.ask_for_login(name, reason=(
-            f"{len(records)} DELFIN job(s) on {name} are followed; their results come back "
-            "and their sessions are told once you log in"))
+        waiting = [r for r in records if not _give_up_if_old(
+            r, known, now, out, f"nobody logged in to {name}")]
+        asked = state.setdefault("login_asked", {})
+        if waiting and now - float(asked.get(name) or 0) >= LOGIN_ASK_EVERY_S:
+            # Once in a while, not every tick: a login item the user put
+            # aside does not come back a minute later.
+            asked[name] = now
+            remote_attention.ask_for_login(name, reason=(
+                f"{len(waiting)} DELFIN job(s) on {name} are followed; their results come "
+                "back and their sessions are told once you log in"))
+        if waiting:
+            out.waiting_for_login.append(name)
         return False
     oldest = min(float(r.get("submitted_at") or now) for r in records)
     since = int(min(GIVE_UP_DAYS * 1440, (now - oldest) / 60 + 60))
@@ -186,39 +211,45 @@ def _follow(name: str, records: list[dict], known: dict, now: float, out: Tick) 
         key = _key(record)
         seen = known.setdefault(key, {"cluster": name, "job_id": str(record["job_id"])})
         job = listing.get(str(record["job_id"]))
-        state = _slurm_state(job.state) if job is not None else ""
-        if not state and not seen.get("ended_at"):
+        said = _slurm_state(job.state) if job is not None else ""
+        if not said and not seen.get("ended_at"):
             try:
-                state = _slurm_state(slurm.job_fields(conn, str(record["job_id"]))
-                                     .get("JobState", ""))
+                said = _slurm_state(slurm.job_fields(conn, str(record["job_id"]))
+                                    .get("JobState", ""))
             except LoginRequired:
                 out.waiting_for_login.append(name)
-                return
+                return False
             except RemoteError:
-                state = ""
-        if state:
-            seen["state"], seen["seen_at"] = state, now
-        if state in ENDED or seen.get("ended_at"):
+                said = ""
+        if said:
+            seen["state"], seen["seen_at"] = said, now
+        if said in ENDED or seen.get("ended_at"):
             seen.setdefault("ended_at", now)
+            if float(seen.get("next_fetch_at") or 0) > now:
+                continue           # a failed fetch waits for its next try
             ended = _resolve(conn, record, seen, now)
             if ended is not None:
                 out.ended.append(ended)
-        elif state:
+        elif said:
             out.following += 1
         else:
             _give_up_if_old(record, known, now, out, f"{name} has said nothing of the job")
     return True
 
 
-def _give_up_if_old(record: dict, known: dict, now: float, out: Tick, why: str) -> None:
+def _give_up_if_old(record: dict, known: dict, now: float, out: Tick, why: str) -> bool:
+    """Give a job up -- reported as such -- once it is GIVE_UP_DAYS old;
+    whether it was."""
     if now - float(record.get("submitted_at") or now) <= GIVE_UP_DAYS * 86400:
-        return
+        return False
     seen = known.setdefault(_key(record), {"cluster": str(record["cluster"]),
                                            "job_id": str(record["job_id"])})
     seen["outcome"] = _outcome(record, seen, state="UNKNOWN", ok=False, judged={
-        "status": "unknown", "outcome": f"given up after {GIVE_UP_DAYS} days: {why}"})
+        "verdict": "failed", "status": "unknown",
+        "outcome": f"given up after {GIVE_UP_DAYS} days: {why}"})
     _notify(record, seen["outcome"])
     out.ended.append(seen["outcome"])
+    return True
 
 
 def _resolve(conn, record: dict, seen: dict, now: float) -> Optional[dict]:
@@ -234,6 +265,7 @@ def _resolve(conn, record: dict, seen: dict, now: float) -> Optional[dict]:
     except (_FetchFailed, RemoteError, OSError) as exc:
         seen["fetch_error"] = str(exc)[:300]
         if seen["fetch_tries"] < FETCH_TRIES:
+            seen["next_fetch_at"] = now + _retry_after(seen["fetch_tries"])
             return None
         fetched = None
     judged = _judge(record, seen, fetched)
@@ -241,6 +273,12 @@ def _resolve(conn, record: dict, seen: dict, now: float) -> Optional[dict]:
                                ok=judged.pop("ok"), judged=judged, fetched=fetched)
     _notify(record, seen["outcome"])
     return seen["outcome"]
+
+
+def _retry_after(tries: int) -> float:
+    """Seconds to the next fetch after ``tries`` failed ones: 1, 3, 9 ...
+    minutes, at most twelve hours."""
+    return float(min(12 * 3600, 60 * 3 ** max(0, tries - 1)))
 
 
 # --- the fetch ---------------------------------------------------------------------
@@ -279,6 +317,11 @@ def _fetch(conn, record: dict) -> dict:
         raise _FetchFailed(f"the job folder could not be listed: {(listed.stderr or '')[:200]}")
     chosen, left = _choose(listed.stdout or "")
     dest.mkdir(parents=True, exist_ok=True)
+    # What marks it as fetched results: cluster_submit never uploads it.
+    (dest / _jobs.RESULTS_MARKER).write_text(json.dumps({
+        "cluster": str(record["cluster"]), "job_id": str(record["job_id"]),
+        "remote_dir": str(record.get("remote_dir") or ""), "fetched_at": time.time()}),
+        encoding="utf-8")
     if chosen:
         fd, names = tempfile.mkstemp(prefix="delfin-fetch-", suffix=".list")
         try:
@@ -342,9 +385,20 @@ def _judge(record: dict, seen: dict, fetched: Optional[dict]) -> dict:
                     exit_code = int(code.group(1))
         except Exception:
             pass
-    ok = state == "COMPLETED" and status in ("succeeded", "finished", "unknown")
-    judged = {"ok": ok, "status": status, "outcome": phrase, "exit_code": exit_code,
-              "signatures": [], "assessment": ""}
+    # Slurm's COMPLETED says the job script ended with 0; DELFIN's own files
+    # say whether the run succeeded. Without them it is not called a success.
+    if state != "COMPLETED" or status == "failed":
+        verdict = "failed"
+    elif status in ("succeeded", "finished"):
+        verdict = "ok"
+    else:
+        verdict = "unverified"
+        phrase = (f"unverified: Slurm says COMPLETED, DELFIN's own files do not say it "
+                  f"succeeded ({phrase})" if fetched is not None else
+                  "unverified: Slurm says COMPLETED, and its results could not be checked")
+    ok = verdict == "ok"
+    judged = {"ok": ok, "verdict": verdict, "status": status, "outcome": phrase,
+              "exit_code": exit_code, "signatures": [], "assessment": ""}
     if not ok and fetched is not None:
         try:
             from delfin.agent import job_fix, job_monitor
@@ -371,6 +425,7 @@ def _outcome(record: dict, seen: dict, *, state: str, ok: bool, judged: dict,
         "key": f"{record['cluster']}:{record['job_id']}", "cluster": str(record["cluster"]),
         "job_id": str(record["job_id"]), "name": str(record.get("name") or ""),
         "kind": str(record.get("kind") or ""), "state": state, "ok": bool(ok),
+        "verdict": judged.get("verdict") or ("ok" if ok else "failed"),
         "status": judged.get("status", "unknown"), "outcome": judged.get("outcome", ""),
         "exit_code": judged.get("exit_code"), "signatures": judged.get("signatures") or [],
         "assessment": judged.get("assessment", ""), "results": results,
@@ -401,10 +456,13 @@ def _notify(record: dict, ended: dict) -> None:
     """The job's notice in NEEDS YOU (run_finished or run_failed). Never raises."""
     try:
         from delfin.agent.attention import emit_attention
-        emit_attention("run_finished" if ended["ok"] else "run_failed",
+        verdict = ended.get("verdict") or ("ok" if ended["ok"] else "failed")
+        said = {"ok": f"finished ({ended['state']})",
+                "unverified": f"finished ({ended['state']}, unverified)"}.get(
+                    verdict, f"failed ({ended['state']})")
+        emit_attention("run_failed" if verdict == "failed" else "run_finished",
                        session_id=ended["session_id"],
-                       title=(f"Job {ended['key']} {'finished' if ended['ok'] else 'failed'} "
-                              f"({ended['state']})"),
+                       title=f"Job {ended['key']} {said}",
                        detail=f"{ended['name'] or 'job'}: {summary(ended)}",
                        workspace=ended["workspace"] or None)
     except Exception:
