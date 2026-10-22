@@ -17790,6 +17790,37 @@ class _DocToolExecutor:
             if not ws:
                 return json.dumps({"error": (
                     "watch_job requires permissions to be configured.")})
+            _watch_sid = str(getattr(permissions, "task_session_id", "")
+                             or "")
+            # A job cluster_submit sent is watched already, as
+            # <cluster>:<id> (job_monitor's cluster kind). Its bare id was
+            # taken for a job of a local SLURM, asked of a scheduler a PC
+            # does not have, and every round then said UNAVAILABLE: the
+            # model polled the cluster instead of ending its turn.
+            try:
+                from .job_monitor import _agent_watch_path, load_watched
+                _sent = {k: e for k, e in load_watched(_agent_watch_path(ws))
+                         .get("jobs", {}).items()
+                         if isinstance(e, dict) and e.get("kind") == "cluster"
+                         and job_id in (k, str(e.get("remote_id") or ""))}
+            except Exception:
+                _sent = {}
+            if _sent:
+                mine = sorted(k for k, e in _sent.items() if not _watch_sid
+                              or str(e.get("session_id") or "") == _watch_sid)
+                if not mine:
+                    return json.dumps({"error": (
+                        f"{', '.join(sorted(_sent))} is a cluster job another "
+                        "session submitted; that session is told when it "
+                        "ends. cluster_status shows its state.")})
+                return json.dumps({
+                    "status": "watching", "job_id": ", ".join(mine),
+                    "kind": "cluster",
+                    "note": ("cluster_submit already watches this job: "
+                             "DELFIN's job watcher brings its results back "
+                             "and you are told in a later turn. End your "
+                             "turn instead of polling."),
+                })
             # A bash job id the registry does not know can never
             # complete, so watching it promises a notification that
             # cannot arrive -- and the note below tells the model to end
@@ -17809,8 +17840,6 @@ class _DocToolExecutor:
                 pass
             try:
                 from .job_monitor import register_agent_job
-                _watch_sid = str(getattr(permissions, "task_session_id", "")
-                                 or "")
                 entry = register_agent_job(
                     ws, job_id,
                     str(arguments.get("description", "") or "")[:200],

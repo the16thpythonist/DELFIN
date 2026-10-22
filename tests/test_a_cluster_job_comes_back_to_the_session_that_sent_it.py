@@ -328,6 +328,28 @@ def test_a_turn_reads_it_when_nothing_woke_the_session(world):
     assert job_monitor.check_agent_jobs(world.ws, session_id="someone-else") == []
 
 
+def test_watch_job_on_a_submitted_job_adds_no_watch_of_a_local_scheduler(world):
+    """The model passed cluster_submit's job id to watch_job: taken for a job
+    of a local SLURM, it was asked of a scheduler the PC does not have, every
+    round said UNAVAILABLE, and the model polled instead of ending its turn."""
+    from delfin.agent import api_client
+    world.submit()
+    perms = api_client.KitToolPermissions(workspace=world.ws, mode="bypassPermissions")
+    perms.task_session_id = SID
+    for job_id in ("4242", "kcist:4242"):
+        out = json.loads(api_client._doc_executor.execute(
+            "watch_job", {"job_id": job_id}, permissions=perms))
+        assert (out["status"], out["job_id"], out["kind"]) == ("watching", "kcist:4242", "cluster")
+    path = job_monitor._agent_watch_path(world.ws)
+    assert list(job_monitor.load_watched(path)["jobs"]) == ["kcist:4242"]
+    assert _told(world) == []
+    perms.task_session_id = "someone-else"
+    out = json.loads(api_client._doc_executor.execute(
+        "watch_job", {"job_id": "4242"}, permissions=perms))
+    assert "another session" in out["error"]
+    assert list(job_monitor.load_watched(path)["jobs"]) == ["kcist:4242"]
+
+
 def test_a_cluster_watch_outlives_the_seven_day_prune_while_followed(world, monkeypatch):
     world.submit()
     path = job_monitor._agent_watch_path(world.ws)
