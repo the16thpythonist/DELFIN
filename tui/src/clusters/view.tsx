@@ -32,7 +32,7 @@
 import type { KeyEvent } from "@opentui/core"
 import { For, batch, createEffect, onCleanup, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
-import type { Keymap } from "../keymap/keymap"
+import { describe, type Keymap } from "../keymap/keymap"
 import { oneLine } from "../store/state"
 import { fit, width } from "../text"
 import type { Theme } from "../theme/theme"
@@ -267,6 +267,8 @@ export interface ClustersView {
    *  (-1: there is none). */
   selectedAt(): number
   jobLines(): JobLine[]
+  /** The keys that go back (esc, ←), as the hints line names them. */
+  backKeys(): string
 }
 
 /** An entry whose details space shows: its key (a cluster's name, a job's
@@ -413,7 +415,7 @@ export function createClustersView(deps: ClustersViewDeps): ClustersView {
     if (!state.open) return false
     const plain = !key.ctrl && !key.meta
     const letter = plain ? (key.sequence ?? "").toLowerCase() : ""
-    if (key.name === "escape") {
+    if (key.name === "escape" || deps.keymap.matches("clustersBack", key)) {
       close()
       return true
     }
@@ -448,15 +450,18 @@ export function createClustersView(deps: ClustersViewDeps): ClustersView {
     return true                           // nothing else leaves the screen
   }
 
-  return { state, open, close, refresh, handleKey, selectedRow, selectedAt, jobLines }
+  const backKeys = () => deps.keymap.keys("clustersBack").map(describe).join("/") || "esc"
+
+  return { state, open, close, refresh, handleKey, selectedRow, selectedAt, jobLines, backKeys }
 }
 
 /** The hints line while a screen is open: what its keys do now. */
 export function clustersHelp(view: ClustersView, room = Infinity): string {
   const row = view.state.open === "clusters" ? view.selectedRow() : undefined
-  const parts = view.state.open === "jobs" ? ["↑↓ select", "space details", "r refresh", "esc back"]
+  const back = `${view.backKeys()} back`
+  const parts = view.state.open === "jobs" ? ["↑↓ select", "space details", "r refresh", back]
     : ["↑↓ select", row?.state === "logged_out" ? "enter log in" : row?.state === "logged_in" ? "o log out" : "",
-       "space details", "r refresh", "esc back"].filter(Boolean)
+       "space details", "r refresh", back].filter(Boolean)
   const kept: string[] = []
   for (const part of parts) {
     if (width([...kept, part].join(" · ")) > room) break

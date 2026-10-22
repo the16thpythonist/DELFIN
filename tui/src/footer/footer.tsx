@@ -324,7 +324,7 @@ export function Footer(props: FooterProps): JSX.Element {
   // Nothing in the footer shrinks: what does not fit is cut at the top
   // (the composer and the keys are at the bottom), never drawn over.
   const placeholder = () => {
-    if (screenOpen()) return "the keys are the screen's: esc goes back"
+    if (screenOpen()) return `the keys are the screen's: ${props.clusters!.backKeys()} goes back`
     const v = props.agents
     if (v?.state.open) {
       if (v.state.renaming) return "the new name…"

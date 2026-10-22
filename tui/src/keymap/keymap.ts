@@ -14,6 +14,7 @@ export type Action =
   | "tasks" | "redraw" | "agents" | "palette" | "quit" | "historyPrev"
   | "historyNext" | "historySearch" | "agentsUp" | "agentsDown" | "agentsOpen"
   | "agentsPeek" | "agentsBack" | "agentsStop" | "agentsRename" | "agentsPin"
+  | "clustersBack"
   | "scrollUp" | "scrollDown" | "scrollTop" | "scrollBottom"
 
 export const DEFAULT_KEYS: Readonly<Record<Action, readonly string[]>> = {
@@ -46,6 +47,8 @@ export const DEFAULT_KEYS: Readonly<Record<Action, readonly string[]>> = {
   agentsStop: ["ctrl+x"],
   agentsRename: ["ctrl+r"],
   agentsPin: ["ctrl+t"],
+  // /clusters and /jobs: back to the conversation, as from the agent view.
+  clustersBack: ["escape", "left"],
   // The conversation, when the window has the whole terminal (the wheel
   // scrolls it too).
   scrollUp: ["pageup"],

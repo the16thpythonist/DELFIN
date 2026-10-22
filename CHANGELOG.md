@@ -126,7 +126,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs (work dir, output files, the DELFIN install it uses) and its
   output's last 20 lines; an agent's background item: its output. Only
   the window asks: the details read files on a cluster and other
-  sessions' output. In `/jobs`, ↑/↓ moves from job to job.
+  sessions' output. In `/jobs`, ↑/↓ moves from job to job; in both screens ←
+  goes back, as esc does (the masked login field keeps it).
 - Everything these screens show from elsewhere (a job name from a
   cluster, a watch file in a workspace, a job's output) is stripped of
   control characters and escape sequences: none reaches the terminal.
